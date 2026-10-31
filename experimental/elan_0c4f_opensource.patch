@@ -1,0 +1,254 @@
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index f9cc52f..5f1f8a6 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -324,6 +324,33 @@ elan_submit_image (FpImageDevice *dev)
+ 
+   G_DEBUG_HERE ();
+ 
++  if (self->dev_type & ELAN_0C4F)
++    {
++      /* Touch/Press mode: extract the full 96x96 stationary impression */
++      raw_frames = self->frames;
++      assembling_ctx.frame_width = self->frame_width;
++      assembling_ctx.frame_height = self->frame_height;
++      assembling_ctx.image_width = self->frame_width;
++      g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
++
++      if (frames != NULL && frames->data != NULL)
++        {
++          struct fpi_frame *f = (struct fpi_frame *) frames->data;
++          img = fp_image_new (self->frame_width, self->frame_height);
++          memcpy (img->data, f->data, self->frame_width * self->frame_height);
++        }
++      else
++        {
++          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_GENERAL);
++          g_slist_free_full (frames, g_free);
++          return;
++        }
++
++      g_slist_free_full (frames, g_free);
++      fpi_image_device_image_captured (dev, img);
++      return;
++    }
++
+   raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
+ 
+   assembling_ctx.frame_width = self->frame_width;
+@@ -411,7 +438,17 @@ elan_cmd_read (FpiSsm *ssm, FpDevice *dev)
+ 
+   transfer = fpi_usb_transfer_new (dev);
+   transfer->ssm = ssm;
+-  transfer->short_is_error = TRUE;
++
++  if (self->dev_type & (ELAN_0C4F | ELAN_0C58))
++    {
++      transfer->short_is_error = FALSE;
++      if (self->cmd->cmd != get_image_cmd.cmd && response_len > 0 && response_len < 64)
++        response_len = 64;
++    }
++  else
++    {
++      transfer->short_is_error = TRUE;
++    }
+ 
+   fpi_usb_transfer_fill_bulk (transfer,
+                               self->cmd->response_in,
+@@ -447,7 +484,10 @@ elan_run_cmd (FpiSsm                *ssm,
+ 
+   transfer = fpi_usb_transfer_new (dev);
+   transfer->ssm = ssm;
+-  transfer->short_is_error = TRUE;
++  if (self->dev_type & (ELAN_0C4F | ELAN_0C58))
++    transfer->short_is_error = FALSE;
++  else
++    transfer->short_is_error = TRUE;
+ 
+   fpi_usb_transfer_fill_bulk_full (transfer,
+                                    ELAN_EP_CMD_OUT,
+@@ -557,12 +597,33 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+           fpi_image_device_report_finger_status (idev, TRUE);
+           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+         }
+-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
+-               (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
++      else if ((self->dev_type & (ELAN_0C58 | ELAN_0C4F)) && self->last_read)
+         {
+-          /* 0x00 - not ready
+-           * 0xaf - finger removed or sensor busy (seen on 0x0c58) */
+-          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
++          guint8 status = self->last_read[0];
++          int min_frames = (self->dev_type & ELAN_0C4F) ? 1 : ELAN_MIN_FRAMES;
++
++          fp_dbg ("elan [0c4f/0c58] capture status byte: 0x%02x, frames: %d",
++                  status, self->num_frames);
++
++          /*
++           * Intercept packet structures coming from 0c4f:
++           * 0x00: idle / settling
++           * 0xaf: finger lifted / transition
++           * 0xff: sensor uncalibrated / idle
++           * 0x01 / 0x02 / 0x03: intermediate touch state
++           */
++          if (self->num_frames >= min_frames)
++            {
++              /* If enough frames are already collected, complete capture gracefully */
++              fp_dbg ("elan [0c4f] non-0x55 received with %d frames; completing capture",
++                      self->num_frames);
++              fpi_ssm_mark_completed (ssm);
++            }
++          else
++            {
++              /* Gracefully retry instead of throwing a hard protocol error */
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 15);
++            }
+         }
+       else
+         {
+@@ -578,7 +639,24 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+       r = elan_save_img_frame (self);
+       if (r < 0)
+         {
+-          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          if (self->dev_type & ELAN_0C4F)
++            {
++              fp_dbg ("elan [0c4f] frame skipped/dark, current frames: %d", self->num_frames);
++              if (self->num_frames >= 1)
++                fpi_ssm_mark_completed (ssm);
++              else
++                fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 15);
++            }
++          else
++            {
++              fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++            }
++        }
++      else if ((self->dev_type & ELAN_0C4F) && self->num_frames >= 2)
++        {
++          /* Touch/Press mode: 2 frames captured during touch is complete */
++          fp_dbg ("elan [0c4f] collected %d frames for touch impression, completing", self->num_frames);
++          fpi_ssm_mark_completed (ssm);
+         }
+       else if (self->num_frames < ELAN_MAX_FRAMES)
+         {
+@@ -599,6 +677,7 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+ {
+   FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
+   FpiDeviceElan *self = FPI_DEVICE_ELAN (_dev);
++  int min_frames = (self->dev_type & ELAN_0C4F) ? 1 : ELAN_MIN_FRAMES;
+ 
+   G_DEBUG_HERE ();
+ 
+@@ -607,21 +686,40 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
+     {
+-      if (self->num_frames >= ELAN_MIN_FRAMES)
++      if (self->num_frames >= min_frames)
+         {
+           elan_submit_image (dev);
+         }
+       else
+         {
+           fp_dbg ("swipe too short: want >= %d frames, got %d",
+-                  ELAN_MIN_FRAMES, self->num_frames);
++                  min_frames, self->num_frames);
+           fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
+         }
+       g_clear_error (&error);
+     }
+   else
+     {
+-      fpi_image_device_session_error (dev, error);
++      /* Graceful error interception for 04f3:0c4f */
++      if ((self->dev_type & ELAN_0C4F) && self->num_frames >= min_frames)
++        {
++          fp_dbg ("elan [0c4f] recovering %d collected frames despite error: %s",
++                  self->num_frames, error ? error->message : "none");
++          elan_submit_image (dev);
++          g_clear_error (&error);
++        }
++      else if ((self->dev_type & ELAN_0C4F) &&
++               (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO) ||
++                g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO)))
++        {
++          fp_dbg ("elan [0c4f] suppressing fatal protocol error; issuing retry scan");
++          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_GENERAL);
++          g_clear_error (&error);
++        }
++      else
++        {
++          fpi_image_device_session_error (dev, error);
++        }
+     }
+ 
+   /* Note: We always stop capturing even if that may not be needed always.
+@@ -867,17 +965,27 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->frame_height = self->raw_frame_height =
+             self->last_read[0];
+         }
+-      /* Work-around sensors returning the sizes as zero-based index
+-       * rather than the number of pixels. */
+-      if ((self->frame_width % 2 == 1) &&
+-          (self->frame_height % 2 == 1))
++      if (self->frame_width == 0 || self->raw_frame_height == 0)
+         {
+-          self->frame_width++;
+-          self->frame_height++;
+-          self->raw_frame_height = self->frame_height;
++          fp_dbg ("Invalid dimensions reported, falling back to 96x96 default");
++          self->frame_width = 96;
++          self->raw_frame_height = 96;
++          self->frame_height = ELAN_MAX_FRAME_HEIGHT;
++        }
++      else
++        {
++          /* Work-around sensors returning the sizes as zero-based index
++           * rather than the number of pixels. */
++          if ((self->frame_width % 2 == 1) &&
++              (self->frame_height % 2 == 1))
++            {
++              self->frame_width++;
++              self->frame_height++;
++              self->raw_frame_height = self->frame_height;
++            }
++          if (!(self->dev_type & ELAN_0C4F) && self->frame_height > ELAN_MAX_FRAME_HEIGHT)
++            self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+         }
+-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
+-        self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
+               self->raw_frame_height);
+       fpi_ssm_next_state (ssm);
+@@ -944,6 +1052,9 @@ dev_init (FpImageDevice *dev)
+       break;
+     }
+ 
++  if (self->dev_type & ELAN_0C4F)
++    fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
++
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 6bbaae0..e5816b9 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -32,6 +32,7 @@
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
+ #define ELAN_0C58 (1 << 3)
++#define ELAN_0C4F (1 << 4)
+ 
+ /* devices which don't require frame rotation before assembling */
+ #define ELAN_NOT_ROTATED ELAN_0C03
+@@ -220,7 +221,7 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c42, .driver_data = ELAN_0C42},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4b, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_0C4F},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_0C58},
