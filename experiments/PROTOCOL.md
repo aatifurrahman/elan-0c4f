@@ -26,11 +26,11 @@ Endpoint 3 IN  (0x83) - Bulk 64 bytes (Command Responses & Event Notifications)
 
 ---
 
-## 2. Key Architectural Discovery: Not Match-on-Chip (MoC)
+## 2. Key Architectural Discovery: Not Match-on-Chip (MoC), It Is Match-on-Host (MoH)
 
 Community efforts previously categorized `04f3:0c4f` as an ELAN Match-on-Chip device (like `04f3:0c4c` in `elanmoc2`).
 
-Live USB tracing of successful authentication and enrollment proved this false:
+Live USB tracing of successful authentication and enrollment proved this false, establishing that `04f3:0c4f` is a Match-on-Host (MoH) raw sensor:
 1. **Templates stored on Host Filesystem**: Enrolled fingerprints are saved as standard Linux files under `/var/lib/fprint/<user>/efd_tod/efd_tod/`:
    - Finger 7 (`right-index-finger`): $52\text{ KB}$ template blob
    - Finger 8 (`right-middle-finger`): $47\text{ KB}$ template blob
@@ -38,7 +38,7 @@ Live USB tracing of successful authentication and enrollment proved this false:
 2. **No templates are sent to the chip**: During verification or enrollment, zero bytes of template or minutiae data are written to the USB device.
 3. **No match tokens are received from the chip**: The chip never reports `MATCH` or `NO_MATCH`.
 4. **The sensor streams raw images**: The hardware sends raw 16-bit ADC frames ($12,800\text{ bytes}$ each) directly to host memory over EP `0x82`.
-5. **Matching happens on the Host CPU**: Lenovo's proprietary TOD binary (`libfprint-2-tod1-elan.so`) bundles ELAN's proprietary host-side image normalization and matcher (`efd_img_normalize_16to8`, `CalcuateMatchScore`).
+5. **Matching happens on the Host CPU**: The vendor TOD driver (`libfprint-2-tod1-elan.so`) bundles ELAN's proprietary host-side image normalization and matcher (`efd_img_normalize_16to8`, `CalcuateMatchScore`).
 
 ---
 

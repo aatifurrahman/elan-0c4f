@@ -1,14 +1,80 @@
 # ELAN 04f3:0c4f Fingerprint Reader on Linux
 
-Complete Linux support for the ELAN `04f3:0c4f` Match-on-Host fingerprint sensor (tested and verified on the **Acer Aspire A715-51G**), offering two driver options:
-1. **Open-Source Driver (Primary)**: Native upstream `libfprint` with OpenCV SIFT/RANSAC (SIGFM matcher) – 100% open-source, zero proprietary binary blobs, with 0 false accepts observed in initial benchmarks ($N=30$, Rule of Three 95% upper bound $\le 10\%$).
+Complete Linux support for the ELAN `04f3:0c4f` Match-on-Host (MoH) fingerprint sensor (tested and verified on the **Acer Aspire A715-51G**), offering two driver options:
+1. **Open-Source Driver (Primary)**: Upstream `libfprint` combined with unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher) and our local sensor driver patch series in `experimental/` – 100% open-source, zero proprietary binary blobs, with 0 false accepts observed in initial benchmarks ($N=30$, Rule of Three 95% upper bound $\le 10\%$).
 2. **Vendor TOD Driver (Instant Fallback)**: Patched proprietary Match-on-Host shim (`libfprint-2-tod1-elan.so`) derived from Lenovo package `r1slf01w.zip`.
 
 ---
 
 ## 1. Open-Source Driver (Primary)
 
-The open-source driver compiles upstream `libfprint` with native ELAN `04f3:0c4f` press-type support and the SIGFM SIFT/RANSAC matcher. It installs into `/usr/local/lib64`, which shadows the distro library without modifying package-managed files.
+The open-source driver is not yet merged into upstream `libfprint`. It is built by taking upstream `libfprint` master, incorporating Natasha England-Elbro's unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher infrastructure), and applying our local patch series (`experimental/elan_0c4f_sigfm_opensource.patch`). The patch introduces `04f3:0c4f` USB ID support to `drivers/elan.c`, $80 \times 80$ sensor geometry, center-frame selection, row-banding/bandpass filtering, biological scale bounds ($[0.80, 1.25]$), 25 px spatial spread constraints, and a 900 ms finger-off debounce. It installs into `/usr/local/lib64`, which shadows the distro library without modifying package-managed files.
+
+### Build & Runtime Requirements
+
+#### Dependency Installation by Distribution
+
+##### Fedora (RPM)
+- **Open-Source Driver (Build & Runtime)**:
+  ```bash
+  sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git \
+      glib2-devel libgusb-devel libgudev-devel pixman-devel nss-devel opencv-devel
+  ```
+  *(Empirically verified in clean Fedora 44 container and on host)*
+- **Vendor TOD Driver**:
+  ```bash
+  sudo dnf install -y dnf-plugins-core
+  sudo dnf copr enable grahamwhiteuk/libfprint-tod
+  sudo dnf swap libfprint libfprint-tod
+  ```
+
+##### Debian / Ubuntu 24.04 LTS (DEB)
+- **Open-Source Driver (Build & Runtime)**:
+  ```bash
+  sudo apt install -y meson ninja-build build-essential pkg-config git \
+      libglib2.0-dev libgusb-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev libopencv-dev
+  ```
+  *(Empirically verified in clean Ubuntu 24.04 container)*
+- **Vendor TOD Driver**:
+  ```bash
+  sudo apt install -y libfprint-2-tod1
+  ```
+
+##### Arch Linux
+- **Open-Source Driver (Build & Runtime)**:
+  ```bash
+  sudo pacman -S --needed meson ninja gcc pkgconf git \
+      glib2 libgusb libgudev pixman nss opencv
+  ```
+  *(Package availability verified in Arch core/extra repositories; container build not executed)*
+- **Vendor TOD Driver**:
+  ```bash
+  yay -S libfprint-tod-git  # Replaces libfprint
+  ```
+
+#### Minimum Versions & Toolchain Requirements
+| Component | Minimum Version | Source / Rationale |
+|---|---|---|
+| **Meson** | `>= 0.56.0` | Specified in `meson.build` (`meson_version: '>= 0.56.0'`). |
+| **C++ Standard** | `C++17` | Required by SIGFM matcher (`cpp_std=c++17` in `meson.build`, GCC $\ge 7$ or Clang $\ge 5$). |
+| **OpenCV** | `>= 4.4.0` | SIFT moved from `opencv_contrib` nonfree module into main `opencv_features2d` in OpenCV 4.4.0 following patent expiration (March 2020). Standard distro packages without patent flags work out of the box. |
+
+#### Runtime Dependency & Driver Scoping Notes
+- **Dynamic Linking to OpenCV**: The compiled `libfprint-2.so.2` dynamically links against OpenCV libraries (`libopencv_core`, `libopencv_features2d`, `libopencv_calib3d`, `libopencv_imgproc`, `libopencv_flann`). OpenCV runtime packages must remain installed; removing them causes `fprintd` to fail at runtime with unresolved shared library errors.
+- **Single-Driver Scoping (`-Ddrivers=elan`)**: The build flags intentionally compile only the `elan` driver. If the resulting `/usr/local/lib64/libfprint-2.so.2` shadows the distro library, other fingerprint reader models attached to the system will not be initialized. Reverting via `./elan-0c4f.sh opensource-uninstall` restores distro multi-device support.
+- **Source & Revision Overrides**: Upstream repository URL and target commit ref can be customized before building via environment variables:
+  ```bash
+  export LIBFPRINT_URL="https://gitlab.freedesktop.org/libfprint/libfprint.git"
+  export LIBFPRINT_MR418_REV="bfb77a332632822196af95ea3763872d293ccd7a"
+  ./elan-0c4f.sh opensource-build
+  ```
+- **Preflight Verification**: Run `./elan-0c4f.sh deps` to test whether all required binaries and pkg-config modules are present before building.
+
+#### Reproducing the Research
+To run the analysis scripts under `experiments/`:
+- **Python Environment**: Python 3 with `numpy` and `opencv-python` (`pip install numpy opencv-python`) for offline evaluations (`eval_offline.py`, `phase3_enrollment_design.py`, `test_matcher_parity.py`, `dataset.py`, `extract_frames.py`).
+- **USB Tracing**: Linux kernel module `usbmon` with Wireshark/`tshark` or `tcpdump` (see `experiments/PROTOCOL.md`), or Windows USBPcap (see `experiments/WINDOWS_TRACING.md`).
+- **C/C++ Minutiae & Scorer Tools**: `gcc`, `g++`, OpenCV development libraries, and NIST NBIS (`libnbis.a` built from `experiments/libfprint-upstream/subprojects/libnbis`) used by `sigfm_scorer.cpp` and `measure_mindtct.c` to evaluate minutiae density distributions.
 
 ### Build & Install
 ```bash
@@ -104,9 +170,22 @@ The open-source pipeline solves this via:
 ---
 
 ## Repository Layout
-- `elan-0c4f.sh` – Unified management CLI (`opensource-build`, `opensource-install`, `opensource-uninstall`, `install`, `uninstall`, `status`)
+- `elan-0c4f.sh` – Unified management CLI (`opensource-build`, `opensource-install`, `opensource-uninstall`, `install`, `uninstall`, `status`, `deps`)
 - `experimental/` – Upstream patch series (`elan_0c4f_sigfm_opensource.patch` for MR !418, `elan_0c4f_mr530.patch` for MR !530) and documentation
 - `experiments/LOG.md` – Experimental log documenting Phases 0 through 7
 - `experiments/PROTOCOL.md` – Reverse-engineered USB protocol specification (Linux & Windows Hello packet analyses)
 - `experiments/WINDOWS_TRACING.md` – Guide for Windows Hello USBPcap capture and analysis
 - `vendor/` – Local directory for vendor package archives (downloaded on demand by `elan-0c4f.sh`)
+
+---
+
+## Glossary
+
+- **Match-on-Host (MoH)**: Biometric architecture where raw sensor frames are streamed over USB to the host CPU, where template extraction, filtering, and matching algorithms execute. (The ELAN `04f3:0c4f` is an MoH device.)
+- **Touch-on-Display / TOD (`libfprint-tod`)**: libfprint's proprietary plugin ABI enabling closed-source vendor shared libraries (`libfprint-2-tod-1-*.so`) to be loaded dynamically at runtime without distributing proprietary source code.
+- **SIGFM**: Scale-Invariant Generalized Feature Matching, the SIFT/RANSAC matcher pipeline originally authored by Natasha England-Elbro in libfprint Merge Request !418.
+- **SIFT**: Scale-Invariant Feature Transform (Lowe, 1999; US Patent 6,711,293 expired March 2020), an algorithm used to detect and describe scale- and rotation-invariant gradient keypoints across fingerprint ridge patterns.
+- **RANSAC**: Random Sample Consensus, an iterative non-deterministic algorithm used to fit a spatial affine transformation between enrolled and candidate keypoint sets under human skin elasticity and geometric constraints.
+- **FAR / FRR**: False Acceptance Rate (the probability that biometric security falsely authenticates an impostor) / False Rejection Rate (the probability that biometric security rejects a genuine enrolled finger).
+- **Rule of Three**: Statistical principle ($p \le 3/N$ at 95% confidence for zero observed failure events in $N$ independent trials) used to mathematically upper-bound the true FAR when zero false accepts occur in empirical trials.
+- **MR**: GitLab Merge Request (e.g., upstream libfprint MR !418 or MR !530).
