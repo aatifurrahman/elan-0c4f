@@ -8,7 +8,7 @@ Complete Linux support for the ELAN `04f3:0c4f` Match-on-Host (MoH) fingerprint 
 
 ## 1. Open-Source Driver (Primary)
 
-The open-source driver is not yet merged into upstream `libfprint`. It is built by taking upstream `libfprint` master, incorporating Natasha England-Elbro's unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher infrastructure), and applying our local patch series (`experimental/elan_0c4f_sigfm_opensource.patch`). The patch introduces `04f3:0c4f` USB ID support to `drivers/elan.c`, $80 \times 80$ sensor geometry, center-frame selection, row-banding/bandpass filtering, biological scale bounds ($[0.80, 1.25]$), 25 px spatial spread constraints, and a 900 ms finger-off debounce. It installs into `/usr/local/lib64`, which shadows the distro library without modifying package-managed files.
+The open-source driver is not yet merged into upstream `libfprint`. It is built by taking upstream `libfprint` master, incorporating Natasha England-Elbro's unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher infrastructure), and applying our local patch series (`experimental/elan_0c4f_sigfm_opensource.patch`). The patch introduces `04f3:0c4f` USB ID support to `drivers/elan.c`, $80 \times 80$ sensor geometry, center-frame selection, row-banding/bandpass filtering, biological scale bounds ($[0.80, 1.25]$), 25 px spatial spread constraints, and a 900 ms finger-off debounce. It installs into `/usr/local/lib64` (Fedora/Arch) or `/usr/local/lib/<multiarch>` (Debian/Ubuntu), which shadows the distro library without modifying package-managed files.
 
 ### Build & Runtime Requirements
 
@@ -18,7 +18,7 @@ The open-source driver is not yet merged into upstream `libfprint`. It is built 
 - **Open-Source Driver (Build & Runtime)**:
   ```bash
   sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git \
-      glib2-devel libgusb-devel libgudev-devel pixman-devel nss-devel opencv-devel
+      glib2-devel libgusb-devel opencv-devel
   ```
   *(Empirically verified in clean Fedora 44 container and on host)*
 - **Vendor TOD Driver**:
@@ -32,9 +32,9 @@ The open-source driver is not yet merged into upstream `libfprint`. It is built 
 - **Open-Source Driver (Build & Runtime)**:
   ```bash
   sudo apt install -y meson ninja-build build-essential pkg-config git \
-      libglib2.0-dev libgusb-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev libopencv-dev
+      libglib2.0-dev libgusb-dev libopencv-dev
   ```
-  *(Empirically verified in clean Ubuntu 24.04 container)*
+  *(Empirically verified in clean Ubuntu 24.04 container via full compilation)*
 - **Vendor TOD Driver**:
   ```bash
   sudo apt install -y libfprint-2-tod1
@@ -44,9 +44,9 @@ The open-source driver is not yet merged into upstream `libfprint`. It is built 
 - **Open-Source Driver (Build & Runtime)**:
   ```bash
   sudo pacman -S --needed meson ninja gcc pkgconf git \
-      glib2 libgusb libgudev pixman nss opencv
+      glib2 libgusb opencv
   ```
-  *(Package availability verified in Arch core/extra repositories; container build not executed)*
+  *(Package availability verified via pacman sync queries in Arch core/extra repositories; container build not executed)*
 - **Vendor TOD Driver**:
   ```bash
   yay -S libfprint-tod-git  # Replaces libfprint
@@ -55,14 +55,17 @@ The open-source driver is not yet merged into upstream `libfprint`. It is built 
 #### Minimum Versions & Toolchain Requirements
 | Component | Minimum Version | Source / Rationale |
 |---|---|---|
-| **Meson** | `>= 0.56.0` | Specified in `meson.build` (`meson_version: '>= 0.56.0'`). |
+| **Meson** | `>= 0.56.0` | Specified in `meson.build` (`meson_version: '>= 0.56.0'`) for the pinned MR !418 checkout (libfprint 1.94.6). Note that newer upstream releases like 1.94.9 bump this to `>= 0.59.0`. |
 | **C++ Standard** | `C++17` | Required by SIGFM matcher (`cpp_std=c++17` in `meson.build`, GCC $\ge 7$ or Clang $\ge 5$). |
 | **OpenCV** | `>= 4.4.0` | SIFT moved from `opencv_contrib` nonfree module into main `opencv_features2d` in OpenCV 4.4.0 following patent expiration (March 2020). Standard distro packages without patent flags work out of the box. |
+| **GObject Introspection** | *Disabled* | Built with `-Dintrospection=false`, eliminating any build dependency on `gobject-introspection-1.0` / `libgirepository1.0-dev`. |
+| **doctest** | *Optional* | Declared with `required: false` in our SIGFM patch. Only required if building unit tests (`sigfm-tests`); not required to build or run the driver. |
 
 #### Runtime Dependency & Driver Scoping Notes
 - **Dynamic Linking to OpenCV**: The compiled `libfprint-2.so.2` dynamically links against OpenCV libraries (`libopencv_core`, `libopencv_features2d`, `libopencv_calib3d`, `libopencv_imgproc`, `libopencv_flann`). OpenCV runtime packages must remain installed; removing them causes `fprintd` to fail at runtime with unresolved shared library errors.
-- **Single-Driver Scoping (`-Ddrivers=elan`)**: The build flags intentionally compile only the `elan` driver. If the resulting `/usr/local/lib64/libfprint-2.so.2` shadows the distro library, other fingerprint reader models attached to the system will not be initialized. Reverting via `./elan-0c4f.sh opensource-uninstall` restores distro multi-device support.
-- **Source & Revision Overrides**: Upstream repository URL and target commit ref can be customized before building via environment variables:
+- **Single-Driver Scoping (`-Ddrivers=elan`)**: The build flags intentionally compile only the `elan` driver. If the resulting `/usr/local/lib64` (or `/usr/local/lib/<multiarch>`) library shadows the distro library, other fingerprint reader models attached to the system will not be initialized. Reverting via `./elan-0c4f.sh opensource-uninstall` restores distro multi-device support.
+- **Installation Paths & Linker Fallback**: Installs into `/usr/local/lib64` on Fedora/Arch and `/usr/local/lib/<multiarch>` (e.g. `/usr/local/lib/x86_64-linux-gnu`) on Debian/Ubuntu. If `/usr/local` is not prioritized by default in the system dynamic linker search path, `elan-0c4f.sh` automatically writes `/etc/ld.so.conf.d/00-elan-0c4f.conf` to guarantee precedence.
+- **Source & Revision Overrides**: Upstream repository URL and target commit ref can be customized before building via environment variables. `LIBFPRINT_MR418_REV` pins commit `bfb77a332632822196af95ea3763872d293ccd7a` (Natasha England-Elbro's tip commit on MR !418):
   ```bash
   export LIBFPRINT_URL="https://gitlab.freedesktop.org/libfprint/libfprint.git"
   export LIBFPRINT_MR418_REV="bfb77a332632822196af95ea3763872d293ccd7a"
@@ -78,10 +81,10 @@ To run the analysis scripts under `experiments/`:
 
 ### Build & Install
 ```bash
-# Build the open-source driver (requires meson, ninja, gcc-c++, opencv-devel)
+# Build the open-source driver (requires meson, ninja, gcc-c++, opencv)
 ./elan-0c4f.sh opensource-build
 
-# Install into /usr/local/lib64 and activate
+# Install into /usr/local/lib64 (or /usr/local/lib/<multiarch>) and activate
 ./elan-0c4f.sh opensource-install
 
 # Check driver status
@@ -182,8 +185,8 @@ The open-source pipeline solves this via:
 ## Glossary
 
 - **Match-on-Host (MoH)**: Biometric architecture where raw sensor frames are streamed over USB to the host CPU, where template extraction, filtering, and matching algorithms execute. (The ELAN `04f3:0c4f` is an MoH device.)
-- **Touch-on-Display / TOD (`libfprint-tod`)**: libfprint's proprietary plugin ABI enabling closed-source vendor shared libraries (`libfprint-2-tod-1-*.so`) to be loaded dynamically at runtime without distributing proprietary source code.
-- **SIGFM**: Scale-Invariant Generalized Feature Matching, the SIFT/RANSAC matcher pipeline originally authored by Natasha England-Elbro in libfprint Merge Request !418.
+- **Touch OEM Drivers / TOD (`libfprint-tod`)**: libfprint's proprietary plugin ABI enabling closed-source vendor shared libraries (`libfprint-2-tod-1-*.so`) to be loaded dynamically at runtime without distributing proprietary source code.
+- **SIGFM**: "SIFT Is Good For Matching", a feature-matching algorithm created by Matthieu Charette (@mpi3d) for small-area Match-on-Host sensors, integrated into libfprint via GitLab Merge Request !418 by Natasha England-Elbro.
 - **SIFT**: Scale-Invariant Feature Transform (Lowe, 1999; US Patent 6,711,293 expired March 2020), an algorithm used to detect and describe scale- and rotation-invariant gradient keypoints across fingerprint ridge patterns.
 - **RANSAC**: Random Sample Consensus, an iterative non-deterministic algorithm used to fit a spatial affine transformation between enrolled and candidate keypoint sets under human skin elasticity and geometric constraints.
 - **FAR / FRR**: False Acceptance Rate (the probability that biometric security falsely authenticates an impostor) / False Rejection Rate (the probability that biometric security rejects a genuine enrolled finger).
