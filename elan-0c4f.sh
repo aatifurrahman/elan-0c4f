@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# ELAN 04f3:0c4f fingerprint: patched Lenovo TOD driver (match-on-chip).
-# Usage: ./elan-0c4f.sh {build|install|uninstall|status}
+# ELAN 04f3:0c4f fingerprint: patched Lenovo TOD driver (vendor TOD driver, Match-on-Host).
+# Usage: ./elan-0c4f.sh {build|install|uninstall|opensource-build|opensource-install|opensource-uninstall|status|deps}
 # Debian/Ubuntu: .deb (dpkg-tracked). Fedora/Arch/other: direct copy into the TOD module dir.
 set -euo pipefail
 
-[ "$(uname -m)" = x86_64 ] || die "x86_64 only"
+die() { echo "error: $*" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 B="$HERE/build"
@@ -17,7 +17,12 @@ VER=0.0.8+0c4f
 SHA_ORIG=a5060ccdfc0c613bd4522be29f87cd94f098e6b83294cf02cd5a958b24b27f80
 SHA_PATCHED=f2ce650d9d9a0a7d547c024bf0929f2b3c45322ebb5927e642b18b0f98fc8ee6
 
-die() { echo "error: $*" >&2; exit 1; }
+# Open-source build inputs. LIBFPRINT_MR418_REV should be a commit reachable from
+# MR !418's head; set it (env or here) for reproducible builds. Empty = track the
+# MR head as it is today.
+LIBFPRINT_URL="${LIBFPRINT_URL:-https://gitlab.freedesktop.org/libfprint/libfprint.git}"
+LIBFPRINT_MR418_REV="${LIBFPRINT_MR418_REV:-}"
+
 
 # ---- distro detection ------------------------------------------------------
 family() {
@@ -43,6 +48,116 @@ module_dir() {
 
 # libfprint must be the TOD-capable build, otherwise the module is silently ignored.
 tod_lib_present() { ldconfig -p | grep 'libfprint-2-tod\.so\.1' >/dev/null; }
+
+# Where the open-source libfprint is installed. Debian/Ubuntu search
+# /usr/local/lib/<multiarch> (not /usr/local/lib64); Fedora-style systems use lib64.
+opensource_dir() {
+  local ma
+  if [ "$(family)" = deb ]; then
+    ma=$(gcc -print-multiarch 2>/dev/null) || ma=x86_64-linux-gnu
+    echo "/usr/local/lib/${ma:-x86_64-linux-gnu}"
+  else
+    echo /usr/local/lib64
+  fi
+}
+
+# Path of the libfprint-2.so.2 that fprintd would actually load (empty if unknown).
+active_libfprint() {
+  local bin
+  for bin in /usr/libexec/fprintd /usr/lib/fprintd/fprintd /usr/lib/fprintd; do
+    if [ -f "$bin" ] && [ -x "$bin" ]; then
+      ldd "$bin" 2>/dev/null | awk '/libfprint-2\.so\.2/{print $3; exit}'
+      return 0
+    fi
+  done
+  return 0
+}
+
+# The open-source build shadows the TOD-capable lib; warn before installing TOD over it.
+warn_opensource_shadow() {
+  local d a found=
+  for d in "$(opensource_dir)" /usr/local/lib64; do
+    compgen -G "$d/libfprint-2.so*" >/dev/null && found=1
+  done
+  [ -n "$found" ] || return 0
+  echo "warning: the open-source libfprint in /usr/local shadows the system/TOD one."
+  if [ -t 0 ]; then
+    read -rp "remove it (runs opensource-uninstall)? [y/N] " a
+    if [[ "${a:-}" =~ ^[Yy]$ ]]; then uninstall_opensource; fi
+  fi
+  return 0
+}
+
+# Preflight check for open-source driver build tools and dependencies.
+check_build_deps() {
+  local missing=()
+  local pkg_cmd=""
+
+  # 1. Toolchain binaries
+  command -v git >/dev/null || missing+=("git")
+  command -v meson >/dev/null || missing+=("meson")
+  if ! command -v ninja >/dev/null && ! command -v ninja-build >/dev/null; then
+    missing+=("ninja (or ninja-build)")
+  fi
+  if ! command -v c++ >/dev/null && ! command -v g++ >/dev/null; then
+    missing+=("C++ compiler (c++ or g++)")
+  fi
+
+  local pc_cmd=""
+  if command -v pkg-config >/dev/null; then
+    pc_cmd="pkg-config"
+  elif command -v pkgconf >/dev/null; then
+    pc_cmd="pkgconf"
+  else
+    missing+=("pkg-config (or pkgconf)")
+  fi
+
+  # 2. Pkg-config modules
+  if [ -n "$pc_cmd" ]; then
+    local mod
+    for mod in glib-2.0 gio-unix-2.0 gobject-2.0 gusb pixman-1 nss gudev-1.0; do
+      if ! "$pc_cmd" --exists "$mod"; then
+        missing+=("pkg-config: $mod")
+      fi
+    done
+    if ! "$pc_cmd" --exists opencv4 && ! "$pc_cmd" --exists opencv; then
+      missing+=("pkg-config: opencv4 (or opencv)")
+    fi
+  else
+    missing+=("pkg-config modules: glib-2.0, gusb, pixman-1, nss, gudev-1.0, opencv4")
+  fi
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    echo "==> All open-source build dependencies are satisfied."
+    return 0
+  fi
+
+  echo "error: missing required build dependencies for open-source driver:" >&2
+  local item
+  for item in "${missing[@]}"; do
+    echo "  - $item" >&2
+  done
+  echo "" >&2
+
+  case "$(family)" in
+    deb)
+      pkg_cmd="sudo apt install -y meson ninja-build build-essential pkg-config git libglib2.0-dev libgusb-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev libopencv-dev"
+      ;;
+    rpm)
+      pkg_cmd="sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git glib2-devel libgusb-devel libgudev-devel pixman-devel nss-devel opencv-devel"
+      ;;
+    arch)
+      pkg_cmd="sudo pacman -S --needed meson ninja gcc pkgconf git glib2 libgusb libgudev pixman nss opencv"
+      ;;
+    *)
+      pkg_cmd="Install meson, ninja, C++17 compiler, git, pkg-config, glib-2.0, gusb, gudev, pixman-1, nss, and opencv4."
+      ;;
+  esac
+
+  echo "To install missing dependencies, run:" >&2
+  echo "  $pkg_cmd" >&2
+  die "build dependencies missing"
+}
 
 need_tod_lib() {
   tod_lib_present && return 0
@@ -82,12 +197,12 @@ clean_diversions() {
 # Portable path: plain copy into the directory libfprint actually scans.
 install_raw() {
   local d; d=$(module_dir) || die "cannot determine TOD module dir"
-  if compgen -G "/usr/local/lib*/libfprint*" >/dev/null; then
+  if compgen -G "/usr/local/lib*/libfprint*" >/dev/null || compgen -G "/usr/local/lib/*/libfprint*" >/dev/null; then
     echo "warning: /usr/local libfprint shadows the system one."
     if [ -t 0 ]; then
       read -rp "remove it? [y/N] " a
       if [[ "${a:-}" =~ ^[Yy]$ ]]; then
-        sudo rm -rf /usr/local/lib*/libfprint* /usr/local/include/libfprint-2 /usr/local/lib*/pkgconfig/libfprint-2.pc
+        sudo rm -rf /usr/local/lib*/libfprint* /usr/local/lib/*/libfprint* /usr/local/include/libfprint-2 /etc/ld.so.conf.d/00-elan-0c4f.conf /usr/local/lib*/pkgconfig/libfprint-2.pc
         sudo ldconfig
       fi
     fi
@@ -100,6 +215,7 @@ install_raw() {
 
 # Extract (nested zip) -> verify stock sha -> patch 3 bytes -> verify patched sha
 build_so() {
+  [ "$(uname -m)" = x86_64 ] || die "the Lenovo TOD module is x86_64-only (the open-source driver has no such limit)"
   mkdir -p "$B"
   if ! { [ -f "$VENDOR_ZIP" ] && echo "$VENDOR_SHA256  $VENDOR_ZIP" | sha256sum -c - >/dev/null 2>&1; }; then
     mkdir -p "$(dirname "$VENDOR_ZIP")"
@@ -162,22 +278,55 @@ CTL
   echo "built $B/${PKG}_${VER}_amd64.deb"
 }
 
+# Clone + pin + patch into a temp dir and move it into place only on success, so a
+# failed step can never leave a half-prepared tree that later builds silently.
+prepare_opensource_src() {
+  local src_dir=$1 patch_file=$2
+  local stamp="$src_dir/.elan-0c4f-patched" patch_sha tmp
+  [ -f "$patch_file" ] || die "missing patch: $patch_file"
+  patch_sha=$(sha256sum "$patch_file" | cut -d' ' -f1)
+
+  if [ -d "$src_dir" ]; then
+    if [ -f "$stamp" ] && grep -qx "patch_sha256=$patch_sha" "$stamp"; then
+      return 0
+    fi
+    # Checkout from an older version of this script (no stamp): accept it if the patch is already in.
+    if git -C "$src_dir" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+      echo "patch_sha256=$patch_sha" > "$stamp"
+      return 0
+    fi
+    die "$src_dir exists but does not contain the current patch. Remove it and re-run."
+  fi
+
+  command -v git >/dev/null || die "git is required to fetch upstream libfprint"
+  mkdir -p "$(dirname "$src_dir")"
+  tmp="$src_dir.tmp.$$"
+  rm -rf "$tmp"
+  echo "==> Cloning upstream libfprint..."
+  {
+    git clone -q "$LIBFPRINT_URL" "$tmp" &&
+    echo "==> Fetching MR !418 (SIGFM baseline)..." &&
+    git -C "$tmp" fetch -q origin merge-requests/418/head:mr-418-sigfm &&
+    git -C "$tmp" checkout -q "${LIBFPRINT_MR418_REV:-mr-418-sigfm}" &&
+    echo "==> Applying ELAN 0c4f open-source driver patch..." &&
+    git -C "$tmp" apply "$patch_file"
+  } || { rm -rf "$tmp"; die "failed to prepare libfprint source (nothing was left behind; see errors above)"; }
+
+  {
+    echo "patch_sha256=$patch_sha"
+    echo "libfprint_head=$(git -C "$tmp" rev-parse HEAD)"
+  } > "$tmp/.elan-0c4f-patched"
+  mv "$tmp" "$src_dir"
+  echo "==> libfprint source ready at $(git -C "$src_dir" rev-parse --short HEAD) (set LIBFPRINT_MR418_REV to pin)"
+}
+
 build_opensource() {
+  check_build_deps
+
   local src_dir="$HERE/experiments/libfprint-upstream"
   local patch_file="$HERE/experimental/elan_0c4f_sigfm_opensource.patch"
 
-  if [ ! -d "$src_dir" ]; then
-    echo "==> Upstream libfprint source not found in $src_dir."
-    echo "==> Cloning upstream libfprint from GitLab..."
-    command -v git >/dev/null || die "git is required to fetch upstream libfprint"
-    mkdir -p "$HERE/experiments"
-    git clone https://gitlab.freedesktop.org/libfprint/libfprint.git "$src_dir"
-    echo "==> Fetching MR !418 (SIGFM baseline)..."
-    git -C "$src_dir" fetch origin merge-requests/418/head:mr-418-sigfm
-    git -C "$src_dir" checkout mr-418-sigfm
-    echo "==> Applying ELAN 0c4f open-source driver patch..."
-    git -C "$src_dir" apply "$patch_file"
-  fi
+  prepare_opensource_src "$src_dir" "$patch_file"
 
   local bdir="$src_dir/build"
   if [ -f "$src_dir/build_test/build.ninja" ]; then
@@ -186,7 +335,6 @@ build_opensource() {
 
   if [ ! -f "$bdir/build.ninja" ]; then
     echo "==> Configuring meson build in $bdir..."
-    command -v meson >/dev/null || die "meson is required to build (install: meson ninja opencv gcc-c++)"
     meson setup "$bdir" "$src_dir" -Ddrivers=elan -Dsigfm=enabled -Dudev_rules=disabled -Dudev_hwdb=disabled -Ddoc=false
   fi
 
@@ -202,6 +350,7 @@ install_opensource() {
     bdir="$src_dir/build_test"
   fi
   local src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
+
   if [ ! -f "$src_so" ]; then
     build_opensource
     if [ -f "$src_dir/build_test/libfprint/libfprint-2.so.2.0.0" ]; then
@@ -209,7 +358,9 @@ install_opensource() {
     fi
     src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
   fi
-  local target_dir="/usr/local/lib64"
+
+  local target_dir active
+  target_dir=$(opensource_dir)
   echo "==> Installing open-source libfprint to $target_dir..."
   sudo mkdir -p "$target_dir"
   sudo install -m 0755 "$src_so" "$target_dir/libfprint-2.so.2.0.0"
@@ -224,29 +375,48 @@ install_opensource() {
   echo "==> Updating system dynamic linker cache (ldconfig)..."
   sudo ldconfig
 
+  # Make sure fprintd would really load this copy; if the dir is not on the
+  # linker path (e.g. /usr/local/lib64 on Debian), add it ahead of the system dirs.
+  active=$(active_libfprint)
+  if [ -n "$active" ] && [[ "$active" != "$target_dir"/* ]]; then
+    echo "==> $target_dir is not first in the linker path; adding /etc/ld.so.conf.d/00-elan-0c4f.conf"
+    echo "$target_dir" | sudo tee /etc/ld.so.conf.d/00-elan-0c4f.conf >/dev/null
+    sudo ldconfig
+    active=$(active_libfprint)
+  fi
+  if [ -n "$active" ] && [[ "$active" != "$target_dir"/* ]]; then
+    echo "warning: fprintd still resolves libfprint to $active, not the open-source build."
+  fi
+
   echo "==> Restarting fprintd.service..."
   sudo systemctl restart fprintd.service || true
 
   echo "=========================================================="
   echo " Open-Source ELAN 0c4f Driver Installed Successfully!"
-  echo " Active library: $(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}')"
+  echo " Active library: ${active:-unknown}"
   echo " Note: Enrolled TOD prints are incompatible with SIGFM."
-  echo " Run:  fprintd-delete \"\$USER\" && fprintd-enroll"
+  echo " Run: fprintd-delete \"\$USER\" && fprintd-enroll"
   echo " To revert to TOD at any time: ./elan-0c4f.sh opensource-uninstall"
   echo "=========================================================="
 }
 
 uninstall_opensource() {
-  local target_dir="/usr/local/lib64"
-  echo "==> Removing open-source libfprint from $target_dir..."
-  sudo rm -f "$target_dir"/libfprint-2.so*
+  local d
+  for d in "$(opensource_dir)" /usr/local/lib64; do
+    echo "==> Removing open-source libfprint from $d..."
+    sudo rm -f "$d"/libfprint-2.so*
+  done
+  sudo rm -f /etc/ld.so.conf.d/00-elan-0c4f.conf
+
   echo "==> Updating system dynamic linker cache (ldconfig)..."
   sudo ldconfig
+
   echo "==> Restarting fprintd.service..."
   sudo systemctl restart fprintd.service || true
+
   echo "=========================================================="
   echo " Reverted to stock/TOD libfprint."
-  echo " Active library: $(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}')"
+  echo " Active library: $(active_libfprint)"
   echo "=========================================================="
 }
 
@@ -256,7 +426,7 @@ case "${1:-}" in
     else build_so; fi
     ;;
   install)
-    [ "$(family)" = deb ] && clean_diversions
+    if [ "$(family)" = deb ]; then clean_diversions; warn_opensource_shadow; fi
     need_tod_lib || exit 1
     build_so
     if [ "$(family)" = deb ]; then
@@ -285,11 +455,11 @@ case "${1:-}" in
   status)
     echo "family: $(family)"
     lsusb -d 04f3:0c4f || echo "04f3:0c4f not present"
-    local_active=$(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}' || true)
+    local_active=$(active_libfprint)
     if [[ "$local_active" =~ ^/usr/local/ ]]; then
       echo "active driver: OPEN-SOURCE (SIGFM SIFT/RANSAC) [$local_active]"
     elif tod_lib_present && [ -f "$(module_dir 2>/dev/null)/$SO_NAME" ]; then
-      echo "active driver: LENOVO TOD (Proprietary Match-on-Chip shim) [$(module_dir 2>/dev/null)/$SO_NAME]"
+      echo "active driver: LENOVO TOD (Proprietary Match-on-Host shim) [$(module_dir 2>/dev/null)/$SO_NAME]"
     else
       echo "active driver: STOCK DISTRO [$local_active]"
     fi
@@ -304,5 +474,8 @@ case "${1:-}" in
     command -v getenforce >/dev/null && echo "selinux: $(getenforce)"
     fprintd-list "${USER:-$(id -un)}" 2>&1 | head -8
     ;;
-  *) die "usage: $0 {build|install|uninstall|opensource-build|opensource-install|opensource-uninstall|status}" ;;
+  deps)
+    check_build_deps
+    ;;
+  *) die "usage: $0 {build|install|uninstall|opensource-build|opensource-install|opensource-uninstall|status|deps}" ;;
 esac

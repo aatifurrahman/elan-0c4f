@@ -1,6 +1,6 @@
 # Reverse-Engineering Findings & Experiments: ELAN 04f3:0c4f
 
-This directory contains live USB packet traces, extracted raw biometric frames, protocol decoder tooling, and reverse-engineering findings comparing the **Lenovo ThinkPad Touch-on-Driver (TOD)** driver on Fedora Linux with the **native Windows Hello** biometric driver on Windows 11 for the **ELAN 04f3:0c4f** fingerprint sensor.
+This directory contains live USB packet traces, extracted raw biometric frames, protocol decoder tooling, and reverse-engineering findings comparing the **vendor TOD driver** (Lenovo package) on Fedora Linux with the **native Windows Hello** biometric driver on Windows 11 for the **ELAN 04f3:0c4f** Match-on-Host (MoH) fingerprint sensor.
 
 ---
 

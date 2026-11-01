@@ -1,6 +1,6 @@
 # ELAN 04f3:0c4f on Fedora Linux
 
-This guide covers the Fedora-specific setup, SELinux considerations, and PAM configuration for the ELAN `04f3:0c4f` fingerprint sensor using the patched Lenovo Touch-on-Driver (TOD) driver.
+This guide covers the Fedora-specific setup, SELinux considerations, and PAM configuration for the ELAN `04f3:0c4f` Match-on-Host (MoH) fingerprint sensor using the vendor TOD driver.
 
 ---
 
