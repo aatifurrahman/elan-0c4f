@@ -115,16 +115,16 @@ check_build_deps() {
   # 2. Pkg-config modules
   if [ -n "$pc_cmd" ]; then
     local mod
-    for mod in glib-2.0 gio-unix-2.0 gobject-2.0 gusb pixman-1 nss gudev-1.0; do
+    for mod in glib-2.0 gio-unix-2.0 gobject-2.0 gusb; do
       if ! "$pc_cmd" --exists "$mod"; then
         missing+=("pkg-config: $mod")
       fi
     done
-    if ! "$pc_cmd" --exists opencv4 && ! "$pc_cmd" --exists opencv; then
-      missing+=("pkg-config: opencv4 (or opencv)")
+    if ! "$pc_cmd" --atleast-version=4.4.0 opencv4 2>/dev/null && ! "$pc_cmd" --atleast-version=4.4.0 opencv 2>/dev/null; then
+      missing+=("pkg-config: opencv4 >= 4.4.0 (or opencv >= 4.4.0)")
     fi
   else
-    missing+=("pkg-config modules: glib-2.0, gusb, pixman-1, nss, gudev-1.0, opencv4")
+    missing+=("pkg-config modules: glib-2.0, gusb, opencv4 (>= 4.4.0)")
   fi
 
   if [ ${#missing[@]} -eq 0 ]; then
@@ -141,16 +141,16 @@ check_build_deps() {
 
   case "$(family)" in
     deb)
-      pkg_cmd="sudo apt install -y meson ninja-build build-essential pkg-config git libglib2.0-dev libgusb-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev libopencv-dev"
+      pkg_cmd="sudo apt install -y meson ninja-build build-essential pkg-config git libglib2.0-dev libgusb-dev libopencv-dev"
       ;;
     rpm)
-      pkg_cmd="sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git glib2-devel libgusb-devel libgudev-devel pixman-devel nss-devel opencv-devel"
+      pkg_cmd="sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git glib2-devel libgusb-devel opencv-devel"
       ;;
     arch)
-      pkg_cmd="sudo pacman -S --needed meson ninja gcc pkgconf git glib2 libgusb libgudev pixman nss opencv"
+      pkg_cmd="sudo pacman -S --needed meson ninja gcc pkgconf git glib2 libgusb opencv"
       ;;
     *)
-      pkg_cmd="Install meson, ninja, C++17 compiler, git, pkg-config, glib-2.0, gusb, gudev, pixman-1, nss, and opencv4."
+      pkg_cmd="Install meson, ninja, C++17 compiler, git, pkg-config, glib-2.0, gusb, and opencv4 (>= 4.4.0)."
       ;;
   esac
 
@@ -335,7 +335,7 @@ build_opensource() {
 
   if [ ! -f "$bdir/build.ninja" ]; then
     echo "==> Configuring meson build in $bdir..."
-    meson setup "$bdir" "$src_dir" -Ddrivers=elan -Dsigfm=enabled -Dudev_rules=disabled -Dudev_hwdb=disabled -Ddoc=false
+    meson setup "$bdir" "$src_dir" -Ddrivers=elan -Dintrospection=false -Dudev_rules=disabled -Dudev_hwdb=disabled -Ddoc=false
   fi
 
   echo "==> Building open-source libfprint with SIGFM (OpenCV SIFT/RANSAC)..."
