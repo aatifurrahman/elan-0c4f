@@ -1,2 +1,27 @@
 build/
+archives/
+*.tar.gz
+*.bundle
+experiments/libfprint-*/
+experiments/**/__pycache__/
+experiments/**/*.log
+experiments/measure_mindtct
+experiments/sigfm_scorer
+experiments/traces/*.txt
+
+# Proprietary vendor binaries & archives
 vendor/*.zip
+vendor/*.so
+
+# Internal agent scaffolding
+.AGENT
+AGENT.md
+**/*.pcap*
+**/*.npz
+**/*_frames/
+**/*.pgm
+**/*.variant
+**/test-storage*
+experiments/data/
+data/
+

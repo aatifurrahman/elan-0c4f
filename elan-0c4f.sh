@@ -162,6 +162,94 @@ CTL
   echo "built $B/${PKG}_${VER}_amd64.deb"
 }
 
+build_opensource() {
+  local src_dir="$HERE/experiments/libfprint-upstream"
+  local patch_file="$HERE/experimental/elan_0c4f_sigfm_opensource.patch"
+
+  if [ ! -d "$src_dir" ]; then
+    echo "==> Upstream libfprint source not found in $src_dir."
+    echo "==> Cloning upstream libfprint from GitLab..."
+    command -v git >/dev/null || die "git is required to fetch upstream libfprint"
+    mkdir -p "$HERE/experiments"
+    git clone https://gitlab.freedesktop.org/libfprint/libfprint.git "$src_dir"
+    echo "==> Fetching MR !418 (SIGFM baseline)..."
+    git -C "$src_dir" fetch origin merge-requests/418/head:mr-418-sigfm
+    git -C "$src_dir" checkout mr-418-sigfm
+    echo "==> Applying ELAN 0c4f open-source driver patch..."
+    git -C "$src_dir" apply "$patch_file"
+  fi
+
+  local bdir="$src_dir/build"
+  if [ -f "$src_dir/build_test/build.ninja" ]; then
+    bdir="$src_dir/build_test"
+  fi
+
+  if [ ! -f "$bdir/build.ninja" ]; then
+    echo "==> Configuring meson build in $bdir..."
+    command -v meson >/dev/null || die "meson is required to build (install: meson ninja opencv gcc-c++)"
+    meson setup "$bdir" "$src_dir" -Ddrivers=elan -Dsigfm=enabled -Dudev_rules=disabled -Dudev_hwdb=disabled -Ddoc=false
+  fi
+
+  echo "==> Building open-source libfprint with SIGFM (OpenCV SIFT/RANSAC)..."
+  ninja -C "$bdir"
+  echo "==> Open-source libfprint built successfully: $bdir/libfprint/libfprint-2.so.2.0.0"
+}
+
+install_opensource() {
+  local src_dir="$HERE/experiments/libfprint-upstream"
+  local bdir="$src_dir/build"
+  if [ -f "$src_dir/build_test/libfprint/libfprint-2.so.2.0.0" ]; then
+    bdir="$src_dir/build_test"
+  fi
+  local src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
+  if [ ! -f "$src_so" ]; then
+    build_opensource
+    if [ -f "$src_dir/build_test/libfprint/libfprint-2.so.2.0.0" ]; then
+      bdir="$src_dir/build_test"
+    fi
+    src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
+  fi
+  local target_dir="/usr/local/lib64"
+  echo "==> Installing open-source libfprint to $target_dir..."
+  sudo mkdir -p "$target_dir"
+  sudo install -m 0755 "$src_so" "$target_dir/libfprint-2.so.2.0.0"
+  sudo ln -sf libfprint-2.so.2.0.0 "$target_dir/libfprint-2.so.2"
+  sudo ln -sf libfprint-2.so.2 "$target_dir/libfprint-2.so"
+
+  if command -v restorecon >/dev/null 2>&1; then
+    echo "==> Restoring SELinux context for $target_dir/libfprint-2.so*..."
+    sudo restorecon -v "$target_dir"/libfprint-2.so* || true
+  fi
+
+  echo "==> Updating system dynamic linker cache (ldconfig)..."
+  sudo ldconfig
+
+  echo "==> Restarting fprintd.service..."
+  sudo systemctl restart fprintd.service || true
+
+  echo "=========================================================="
+  echo " Open-Source ELAN 0c4f Driver Installed Successfully!"
+  echo " Active library: $(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}')"
+  echo " Note: Enrolled TOD prints are incompatible with SIGFM."
+  echo " Run:  fprintd-delete \"\$USER\" && fprintd-enroll"
+  echo " To revert to TOD at any time: ./elan-0c4f.sh opensource-uninstall"
+  echo "=========================================================="
+}
+
+uninstall_opensource() {
+  local target_dir="/usr/local/lib64"
+  echo "==> Removing open-source libfprint from $target_dir..."
+  sudo rm -f "$target_dir"/libfprint-2.so*
+  echo "==> Updating system dynamic linker cache (ldconfig)..."
+  sudo ldconfig
+  echo "==> Restarting fprintd.service..."
+  sudo systemctl restart fprintd.service || true
+  echo "=========================================================="
+  echo " Reverted to stock/TOD libfprint."
+  echo " Active library: $(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}')"
+  echo "=========================================================="
+}
+
 case "${1:-}" in
   build)
     if [ "$(family)" = deb ]; then build_deb
@@ -185,20 +273,36 @@ case "${1:-}" in
     if [ "$(family)" = deb ]; then sudo apt-get remove -y "$PKG"
     else d=$(module_dir 2>/dev/null) && sudo rm -fv "$d/$SO_NAME" && sudo systemctl restart fprintd.service; fi
     ;;
+  opensource-build|build-opensource)
+    build_opensource
+    ;;
+  opensource-install|install-opensource)
+    install_opensource
+    ;;
+  opensource-uninstall|uninstall-opensource)
+    uninstall_opensource
+    ;;
   status)
     echo "family: $(family)"
     lsusb -d 04f3:0c4f || echo "04f3:0c4f not present"
+    local_active=$(ldd /usr/libexec/fprintd 2>/dev/null | grep libfprint-2.so.2 | awk '{print $3}' || true)
+    if [[ "$local_active" =~ ^/usr/local/ ]]; then
+      echo "active driver: OPEN-SOURCE (SIGFM SIFT/RANSAC) [$local_active]"
+    elif tod_lib_present && [ -f "$(module_dir 2>/dev/null)/$SO_NAME" ]; then
+      echo "active driver: LENOVO TOD (Proprietary Match-on-Chip shim) [$(module_dir 2>/dev/null)/$SO_NAME]"
+    else
+      echo "active driver: STOCK DISTRO [$local_active]"
+    fi
     tod_lib_present && echo "TOD libfprint: yes" || echo "TOD libfprint: NO"
     if d=$(module_dir); then
       echo "module dir: $d"
       [ -f "$d/$SO_NAME" ] && echo "installed sha: $(sha256sum "$d/$SO_NAME" | cut -d' ' -f1)  (want $SHA_PATCHED)"
     fi
-    compgen -G "/usr/local/lib*/libfprint*" >/dev/null && echo "stale /usr/local libfprint: YES (shadows TOD libfprint; remove: sudo rm -f /usr/local/lib*/libfprint* && sudo ldconfig)"
     [ "$(family)" = rpm ] && { rpm -q fprintd-pam >/dev/null 2>&1 || echo "PAM module: fprintd-pam NOT installed (run: sudo dnf install fprintd-pam)"; }
     [ "$(family)" = deb ] && { dpkg -s "$PKG" 2>/dev/null | grep -E '^(Status|Version)' || true
       echo "holds: $(apt-mark showhold | grep -E 'libfprint' || echo none)"; }
     command -v getenforce >/dev/null && echo "selinux: $(getenforce)"
     fprintd-list "${USER:-$(id -un)}" 2>&1 | head -8
     ;;
-  *) die "usage: $0 {build|install|uninstall|status}" ;;
+  *) die "usage: $0 {build|install|uninstall|opensource-build|opensource-install|opensource-uninstall|status}" ;;
 esac
