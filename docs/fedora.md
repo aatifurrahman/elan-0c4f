@@ -80,11 +80,19 @@ sudo authselect apply-changes
 Test PAM authentication:
 
 ```bash
-sudo -k
-sudo whoami
+# Verify via CLI:
+fprintd-verify "$USER"
 ```
 
-Touch the sensor when prompted to verify that `sudo` authenticates via fingerprint.
+### Scoping Sudo to Password-Only (Recommended)
+By default, `authselect enable-feature with-fingerprint` enables `pam_fprintd.so` globally in `/etc/pam.d/system-auth`, which applies to `sudo`, lockscreen, and GDM.
+To scope `sudo` strictly to password authentication while keeping desktop lockscreen fingerprint unlock intact:
+
+```bash
+sudo sed -i 's/^auth\s*include\s*system-auth/auth       include      password-auth/' /etc/pam.d/sudo
+```
+
+This isolates `sudo` (and `sudo-i`) to passwords, leaving `gdm-fingerprint` (which includes `fingerprint-auth`) fully functional for fast screen unlock.
 
 ---
 

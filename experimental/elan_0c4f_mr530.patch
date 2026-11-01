@@ -1,0 +1,885 @@
+From 55e9831cf119b1e9d6ccc84417d21d81cb0125bb Mon Sep 17 00:00:00 2001
+From: Mohammad Aatifurrahman <aatifurrahman@live.com>
+Date: Sun, 1 Nov 2026 13:27:26 +0530
+Subject: [PATCH] feat(elan): add ELAN 0c4f support with SIGFM SIFT/RANSAC on
+ mr-530
+
+---
+ libfprint/drivers/elan.c     | 190 +++++++++++++++++++++++++++++------
+ libfprint/drivers/elan.h     |  12 +--
+ libfprint/fpi-image-device.c |  89 ++++++++++++----
+ libfprint/fpi-image-device.h |   3 +
+ libfprint/sigfm/meson.build  |   9 +-
+ libfprint/sigfm/sigfm.cpp    | 184 ++++++++++++++++-----------------
+ 6 files changed, 330 insertions(+), 157 deletions(-)
+
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index 36653fb..5e02bb0 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -19,6 +19,23 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++/*
++ * The algorithm which libfprint uses to match fingerprints doesn't like small
++ * images like the ones these drivers produce. There's just not enough minutiae
++ * (recognizable print-specific points) on them for a reliable match. This means
++ * that unless another matching algo is found/implemented, these readers will
++ * not work as good with libfprint as they do with vendor drivers.
++ *
++ * To get bigger images the driver expects you to swipe the finger over the
++ * reader. This works quite well for readers with a rectangular 144x64 sensor.
++ * Worse than real swipe readers but good enough for day-to-day use. It needs
++ * a steady and relatively slow swipe. There are also square 96x96 sensors and
++ * I don't know whether they are in fact usable or not because I don't have one.
++ * I imagine they'd be less reliable because the resulting image is even
++ * smaller. If they can't be made usable with libfprint, I might end up dropping
++ * them because it's better than saying they work when they don't.
++ */
++
+ #define FP_COMPONENT "elan"
+ 
+ #include "drivers_api.h"
+@@ -67,10 +84,21 @@ struct _FpiDeviceElan
+   unsigned char   raw_frame_height;
+   int             num_frames;
+   GSList         *frames;
++  guint           finger_off_timeout_id;
+   /* end state */
+ };
+ G_DEFINE_TYPE (FpiDeviceElan, fpi_device_elan, FP_TYPE_IMAGE_DEVICE);
+ 
++static gboolean
++elan_0c4f_finger_off_cb (gpointer user_data)
++{
++  FpiDeviceElan *self = FPI_DEVICE_ELAN (user_data);
++  self->finger_off_timeout_id = 0;
++  fp_dbg ("elan [0c4f] finger-off debounce expired; reporting finger removed");
++  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
++  return G_SOURCE_REMOVE;
++}
++
+ static int
+ cmp_short (const void *a, const void *b)
+ {
+@@ -82,6 +110,12 @@ elan_dev_reset_state (FpiDeviceElan *elandev)
+ {
+   G_DEBUG_HERE ();
+ 
++  if (elandev->finger_off_timeout_id)
++    {
++      g_source_remove (elandev->finger_off_timeout_id);
++      elandev->finger_off_timeout_id = 0;
++    }
++
+   elandev->cmd = NULL;
+   elandev->cmd_timeout = ELAN_CMD_TIMEOUT;
+ 
+@@ -129,7 +163,7 @@ elan_save_frame (FpiDeviceElan *self, unsigned short *frame)
+           raw_idx = frame_margin + y + x * raw_height;
+         frame_idx = x + y * frame_width;
+         frame[frame_idx] =
+-          GUINT16_FROM_LE (((unsigned short *) self->last_read)[raw_idx]);
++          ((unsigned short *) self->last_read)[raw_idx];
+       }
+ }
+ 
+@@ -234,12 +268,7 @@ elan_process_frame_linear (unsigned short *raw_frame,
+         max = raw_frame[i];
+     }
+ 
+-  if (max == min)
+-    {
+-      memset (frame->data, 0, frame_size);
+-      *frames = g_slist_prepend (*frames, frame);
+-      g_return_if_reached ();
+-    }
++  g_assert (max != min);
+ 
+   unsigned short px;
+ 
+@@ -275,11 +304,6 @@ elan_process_frame_thirds (unsigned short *raw_frame,
+   lvl3 = sorted[frame_size - 1];
+   g_free (sorted);
+ 
+-  /* Ensure levels are strictly monotonic to prevent division by zero */
+-  lvl1 = MAX (lvl1, lvl0 + 1);
+-  lvl2 = MAX (lvl2, lvl1 + 1);
+-  lvl3 = MAX (lvl3, lvl2 + 1);
+-
+   unsigned short px;
+ 
+   for (int i = 0; i < frame_size; i++)
+@@ -307,6 +331,34 @@ elan_submit_image (FpImageDevice *dev)
+ 
+   G_DEBUG_HERE ();
+ 
++  if (self->dev_type & ELAN_0C4F)
++    {
++      /* Touch/Press mode: extract the stationary impression without swipe stitching */
++      raw_frames = self->frames;
++      assembling_ctx.frame_width = self->frame_width;
++      assembling_ctx.frame_height = self->frame_height;
++      assembling_ctx.image_width = self->frame_width;
++      g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
++
++      if (frames != NULL && frames->data != NULL)
++        {
++          guint len = g_slist_length (frames);
++          struct fpi_frame *f = (struct fpi_frame *) g_slist_nth_data (frames, len / 2);
++          img = fp_image_new (self->frame_width, self->frame_height);
++          memcpy (img->data, f->data, self->frame_width * self->frame_height);
++        }
++      else
++        {
++          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_GENERAL);
++          g_slist_free_full (frames, g_free);
++          return;
++        }
++
++      g_slist_free_full (frames, g_free);
++      fpi_image_device_image_captured (dev, img);
++      return;
++    }
++
+   raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
+ 
+   assembling_ctx.frame_width = self->frame_width;
+@@ -394,7 +446,17 @@ elan_cmd_read (FpiSsm *ssm, FpDevice *dev)
+ 
+   transfer = fpi_usb_transfer_new (dev);
+   transfer->ssm = ssm;
+-  transfer->short_is_error = TRUE;
++
++  if (self->dev_type & ELAN_0C4F)
++    {
++      transfer->short_is_error = FALSE;
++      if (self->cmd->cmd != get_image_cmd.cmd && response_len > 0 && response_len < 64)
++        response_len = 64;
++    }
++  else
++    {
++      transfer->short_is_error = TRUE;
++    }
+ 
+   fpi_usb_transfer_fill_bulk (transfer,
+                               self->cmd->response_in,
+@@ -430,7 +492,10 @@ elan_run_cmd (FpiSsm                *ssm,
+ 
+   transfer = fpi_usb_transfer_new (dev);
+   transfer->ssm = ssm;
+-  transfer->short_is_error = TRUE;
++  if (self->dev_type & ELAN_0C4F)
++    transfer->short_is_error = FALSE;
++  else
++    transfer->short_is_error = TRUE;
+ 
+   fpi_usb_transfer_fill_bulk_full (transfer,
+                                    ELAN_EP_CMD_OUT,
+@@ -488,7 +553,18 @@ stop_capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+     }
+ 
+   if (!error)
+-    fpi_image_device_report_finger_status (dev, FALSE);
++    {
++      if (self->dev_type & ELAN_0C4F)
++        {
++          if (self->finger_off_timeout_id)
++            g_source_remove (self->finger_off_timeout_id);
++          self->finger_off_timeout_id = g_timeout_add (900, elan_0c4f_finger_off_cb, self);
++        }
++      else
++        {
++          fpi_image_device_report_finger_status (dev, FALSE);
++        }
++    }
+   else
+     /* NOTE: We cannot get a cancellation error here. */
+     fpi_image_device_session_error (dev, error);
+@@ -540,17 +616,29 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+           fpi_image_device_report_finger_status (idev, TRUE);
+           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
+         }
+-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
+-               (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
++      else if ((self->dev_type & ELAN_0C4F) && self->last_read)
+         {
+-          /* 0x00 - not ready
+-           * 0xaf - finger removed or sensor busy (seen on 0x0c58) */
+-          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
++          guint8 status = self->last_read[0];
++          int min_frames = 1;
++
++          fp_dbg ("elan [0c4f] capture status byte: 0x%02x, frames: %d",
++                  status, self->num_frames);
++
++          if (self->num_frames >= min_frames)
++            {
++              fp_dbg ("elan [0c4f] non-0x55 received with %d frames; completing capture",
++                      self->num_frames);
++              fpi_ssm_mark_completed (ssm);
++            }
++          else
++            {
++              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 15);
++            }
+         }
+       else
+         {
+           /* XXX: The timeout is emulated incorrectly, resulting in a zero byte read. */
+-          if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
++          if (g_strcmp0 (g_getenv ("FP_DEVICE_EMULATION"), "1") == 0)
+             fpi_ssm_mark_completed (ssm);
+           else
+             fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+@@ -561,7 +649,23 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
+       r = elan_save_img_frame (self);
+       if (r < 0)
+         {
+-          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++          if (self->dev_type & ELAN_0C4F)
++            {
++              fp_dbg ("elan [0c4f] frame skipped/dark, current frames: %d", self->num_frames);
++              if (self->num_frames >= 1)
++                fpi_ssm_mark_completed (ssm);
++              else
++                fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 15);
++            }
++          else
++            {
++              fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++            }
++        }
++      else if ((self->dev_type & ELAN_0C4F) && self->num_frames >= 2)
++        {
++          fp_dbg ("elan [0c4f] collected %d frames for touch impression, completing", self->num_frames);
++          fpi_ssm_mark_completed (ssm);
+         }
+       else if (self->num_frames < ELAN_MAX_FRAMES)
+         {
+@@ -582,6 +686,7 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+ {
+   FpImageDevice *dev = FP_IMAGE_DEVICE (_dev);
+   FpiDeviceElan *self = FPI_DEVICE_ELAN (_dev);
++  int min_frames = (self->dev_type & ELAN_0C4F) ? 1 : ELAN_MIN_FRAMES;
+ 
+   G_DEBUG_HERE ();
+ 
+@@ -590,21 +695,40 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
+       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
+     {
+-      if (self->num_frames >= ELAN_MIN_FRAMES)
++      if (self->num_frames >= min_frames)
+         {
+           elan_submit_image (dev);
+         }
+       else
+         {
+           fp_dbg ("swipe too short: want >= %d frames, got %d",
+-                  ELAN_MIN_FRAMES, self->num_frames);
++                  min_frames, self->num_frames);
+           fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_TOO_SHORT);
+         }
+       g_clear_error (&error);
+     }
+   else
+     {
+-      fpi_image_device_session_error (dev, error);
++      /* Graceful error recovery for ELAN 04f3:0c4f */
++      if ((self->dev_type & ELAN_0C4F) && self->num_frames >= min_frames)
++        {
++          fp_dbg ("elan [0c4f] recovering %d collected frames despite error: %s",
++                  self->num_frames, error ? error->message : "none");
++          elan_submit_image (dev);
++          g_clear_error (&error);
++        }
++      else if ((self->dev_type & ELAN_0C4F) &&
++               (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO) ||
++                g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO)))
++        {
++          fp_dbg ("elan [0c4f] suppressing fatal protocol error; issuing retry scan");
++          fpi_image_device_retry_scan (dev, FP_DEVICE_RETRY_GENERAL);
++          g_clear_error (&error);
++        }
++      else
++        {
++          fpi_image_device_session_error (dev, error);
++        }
+     }
+ 
+   /* Note: We always stop capturing even if that may not be needed always.
+@@ -795,7 +919,7 @@ elan_calibrate (FpiDeviceElan *self)
+ 
+   g_return_if_fail (!self->active);
+   self->active = TRUE;
+-  self->calib_atts_left = ELAN_CALIBRATION_ATTEMPTS (self->dev_type);
++  self->calib_atts_left = ELAN_CALIBRATION_ATTEMPTS;
+ 
+   FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (self), calibrate_run_state,
+                              CALIBRATE_NUM_STATES);
+@@ -859,7 +983,7 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
+           self->frame_height++;
+           self->raw_frame_height = self->frame_height;
+         }
+-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
++      if (!(self->dev_type & ELAN_0C4F) && self->frame_height > ELAN_MAX_FRAME_HEIGHT)
+         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
+       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
+               self->raw_frame_height);
+@@ -925,6 +1049,14 @@ dev_init (FpImageDevice *dev)
+     case ELAN_0907:
+       self->process_frame = elan_process_frame_linear;
+       break;
++
++    case ELAN_0C4F:
++      self->process_frame = elan_process_frame_linear;
++      fpi_device_set_scan_type (FP_DEVICE (dev), FP_SCAN_TYPE_PRESS);
++      fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), 16);
++      fpi_image_device_set_algorithm (dev, FPI_DEVICE_ALGO_SIGFM);
++      fpi_image_device_set_score_threshold (dev, 12);
++      break;
+     }
+ 
+   fpi_image_device_open_complete (dev, NULL);
+ }
+ 
++static void
++dev_probe (FpDevice *device)
++{
++  int dev_type = fpi_device_get_driver_data (device);
++
++  if (dev_type == ELAN_0C4F)
++    {
++      fpi_device_set_scan_type (device, FP_SCAN_TYPE_PRESS);
++      fpi_device_set_nr_enroll_stages (device, 16);
++    }
++
++  fpi_device_probe_complete (device, NULL, NULL, NULL);
++}
++
+ static void
+ fpi_device_elan_init (FpiDeviceElan *self)
+ {
+ }
+@@ -998,8 +1130,22 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
+   dev_class->full_name = "ElanTech Fingerprint Sensor";
+   dev_class->type = FP_DEVICE_TYPE_USB;
+   dev_class->id_table = elan_id_table;
+-  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+-  dev_class->nr_enroll_stages = 15;
++  dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
++  dev_class->probe = dev_probe;
+ 
+   img_class->img_open = dev_init;
+   img_class->img_close = dev_deinit;
+@@ -1007,6 +1153,5 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
+   img_class->deactivate = dev_deactivate;
+   img_class->change_state = dev_change_state;
+ 
+-  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
+   img_class->score_threshold = 24;
+ }
+diff --git a/libfprint/drivers/elan.h b/libfprint/drivers/elan.h
+index 6bbaae0..539c676 100644
+--- a/libfprint/drivers/elan.h
++++ b/libfprint/drivers/elan.h
+@@ -31,10 +31,10 @@
+ #define ELAN_0907 (1 << 0)
+ #define ELAN_0C03 (1 << 1)
+ #define ELAN_0C42 (1 << 2)
+-#define ELAN_0C58 (1 << 3)
++#define ELAN_0C4F (1 << 3)
+ 
+ /* devices which don't require frame rotation before assembling */
+-#define ELAN_NOT_ROTATED ELAN_0C03
++#define ELAN_NOT_ROTATED (ELAN_0C03 | ELAN_0C4F)
+ 
+ /* min FW version that supports calibration */
+ #define ELAN_MIN_CALIBRATION_FW 0x0138
+@@ -45,9 +45,7 @@
+ 
+ /* times to retry reading calibration status during one session
+  * generally prevents calibration from looping indefinitely */
+-#define ELAN_DEFAULT_CALIBRATION_ATTEMPTS 10
+-#define ELAN_CALIBRATION_ATTEMPTS(dev_type) \
+-  ((dev_type) == ELAN_0C58 ? 30 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
++#define ELAN_CALIBRATION_ATTEMPTS 10
+ 
+ /* min and max frames in a capture */
+ #define ELAN_MIN_FRAMES 7
+@@ -220,10 +218,10 @@ static const FpIdEntry elan_id_table[] = {
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c42, .driver_data = ELAN_0C42},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4b, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c4d, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_ALL_DEV},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c4f, .driver_data = ELAN_0C4F},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c63, .driver_data = ELAN_ALL_DEV},
+   {.vid = ELAN_VEND_ID,  .pid = 0x0c6e, .driver_data = ELAN_ALL_DEV},
+-  {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_0C58},
++  {.vid = ELAN_VEND_ID,  .pid = 0x0c58, .driver_data = ELAN_ALL_DEV},
+   {.vid = 0,  .pid = 0,  .driver_data = 0},
+ };
+ 
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 7d27fac..cd7d6c8 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -121,13 +121,10 @@ fp_image_device_change_state (FpImageDevice *self, FpiImageDeviceState state)
+     { FPI_IMAGE_DEVICE_STATE_DEACTIVATING, FPI_IMAGE_DEVICE_STATE_INACTIVE },
+   };
+ 
+-  if (!g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN))
+-    {
+-      prev_state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, priv->state);
+-      state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, state);
+-      fp_dbg ("Image device internal state change from %s to %s",
+-              prev_state_str, state_str);
+-    }
++  prev_state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, priv->state);
++  state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, state);
++  fp_dbg ("Image device internal state change from %s to %s",
++          prev_state_str, state_str);
+ 
+   for (i = 0; i < G_N_ELEMENTS (valid_transitions); i++)
+     {
+@@ -138,15 +135,8 @@ fp_image_device_change_state (FpImageDevice *self, FpiImageDeviceState state)
+         }
+     }
+   if (!transition_is_valid)
+-    {
+-      if (!prev_state_str)
+-        prev_state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, priv->state);
+-      if (!state_str)
+-        state_str = g_enum_to_string (FPI_TYPE_IMAGE_DEVICE_STATE, state);
+-
+-      g_warning ("Internal state machine issue: transition from %s to %s should not happen!",
+-                 prev_state_str, state_str);
+-    }
++    g_warning ("Internal state machine issue: transition from %s to %s should not happen!",
++               prev_state_str, state_str);
+ 
+   priv->state = state;
+   g_object_notify (G_OBJECT (self), "fpi-image-device-state");
+@@ -225,6 +215,10 @@ fp_image_device_maybe_complete_action (FpImageDevice *self, GError *error)
+ 
+       fpi_device_enroll_complete (device, g_object_ref (enroll_print), NULL);
+     }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      fpi_device_verify_complete (device, NULL);
++    }
+   else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+     {
+       fpi_device_identify_complete (device, NULL);
+@@ -323,6 +317,31 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+           fp_image_device_enroll_maybe_await_finger_on (FP_IMAGE_DEVICE (device));
+         }
+     }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      FpPrint *template;
++      FpiMatchResult result;
++
++      fpi_device_get_verify_data (device, &template);
++      if (print)
++        {
++          if (priv->algorithm == FPI_PRINT_NBIS)
++            result = fpi_print_bz3_match (template, print, priv->score_threshold,
++                                          &error);
++          else if (priv->algorithm == FPI_PRINT_SIGFM)
++            result = fpi_print_sigfm_match (template, print, priv->score_threshold,
++                                            &error);
++        }
++      else
++        {
++          result = FPI_MATCH_ERROR;
++        }
++
++      if (!error || error->domain == FP_DEVICE_RETRY)
++        fpi_device_verify_report (device, result, g_steal_pointer (&print), g_steal_pointer (&error));
++
++      fp_image_device_maybe_complete_action (self, g_steal_pointer (&error));
++    }
+   else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+     {
+       gint i;
+@@ -391,6 +410,24 @@ fpi_image_device_set_score_threshold (FpImageDevice *self,
+   priv->score_threshold = score_threshold;
+ }
+ 
++/**
++ * fpi_image_device_set_algorithm:
++ * @self: a #FpImageDevice imaging fingerprint device
++ * @algorithm: #FpiImageDeviceAlgorithm to use for extraction/matching
++ *
++ * Dynamically adjust the matching algorithm.
++ */
++void
++fpi_image_device_set_algorithm (FpImageDevice           *self,
++                                FpiImageDeviceAlgorithm  algorithm)
++{
++  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
++
++  g_return_if_fail (FP_IS_IMAGE_DEVICE (self));
++
++  priv->algorithm = (FpiPrintType) algorithm;
++}
++
+ /**
+  * fpi_image_device_report_finger_status:
+  * @self: a #FpImageDevice imaging fingerprint device
+@@ -485,6 +522,7 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+   g_return_if_fail (image != NULL);
+   g_return_if_fail (priv->state == FPI_IMAGE_DEVICE_STATE_CAPTURE);
+   g_return_if_fail (action == FPI_DEVICE_ACTION_ENROLL ||
++                    action == FPI_DEVICE_ACTION_VERIFY ||
+                     action == FPI_DEVICE_ACTION_IDENTIFY ||
+                     action == FPI_DEVICE_ACTION_CAPTURE);
+ 
+@@ -533,6 +571,7 @@ fpi_image_device_retry_scan (FpImageDevice *self, FpDeviceRetry retry)
+    * all but INACTIVE */
+   g_return_if_fail (priv->state != FPI_IMAGE_DEVICE_STATE_INACTIVE);
+   g_return_if_fail (action == FPI_DEVICE_ACTION_ENROLL ||
++                    action == FPI_DEVICE_ACTION_VERIFY ||
+                     action == FPI_DEVICE_ACTION_IDENTIFY ||
+                     action == FPI_DEVICE_ACTION_CAPTURE);
+ 
+@@ -545,6 +584,13 @@ fpi_image_device_retry_scan (FpImageDevice *self, FpDeviceRetry retry)
+ 
+       fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
+     }
++  else if (action == FPI_DEVICE_ACTION_VERIFY)
++    {
++      fpi_device_verify_report (FP_DEVICE (self), FPI_MATCH_ERROR, NULL, error);
++      fp_image_device_maybe_complete_action (self, NULL);
++      fpi_image_device_deactivate (self, TRUE);
++
++    }
+   else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+     {
+       fpi_device_identify_report (FP_DEVICE (self), NULL, NULL, error);
+@@ -563,7 +609,7 @@ fpi_image_device_retry_scan (FpImageDevice *self, FpDeviceRetry retry)
+ /**
+  * fpi_image_device_session_error:
+  * @self: a #FpImageDevice imaging fingerprint device
+- * @error: (nullable) (transfer full): The #GError to report.
++ * @error: The #GError to report
+  *
+  * Report an error while interacting with the device. This effectively
+  * aborts the current ongoing action. Note that doing so will result in
+@@ -622,7 +668,7 @@ fpi_image_device_session_error (FpImageDevice *self, GError *error)
+ /**
+  * fpi_image_device_activate_complete:
+  * @self: a #FpImageDevice imaging fingerprint device
+- * @error: (nullable) (transfer full): The #GError or %NULL on success
++ * @error: A #GError or %NULL on success
+  *
+  * Reports completion of device activation.
+  */
+@@ -637,6 +683,7 @@ fpi_image_device_activate_complete (FpImageDevice *self, GError *error)
+   g_return_if_fail (priv->active == FALSE);
+   g_return_if_fail (priv->state == FPI_IMAGE_DEVICE_STATE_ACTIVATING);
+   g_return_if_fail (action == FPI_DEVICE_ACTION_ENROLL ||
++                    action == FPI_DEVICE_ACTION_VERIFY ||
+                     action == FPI_DEVICE_ACTION_IDENTIFY ||
+                     action == FPI_DEVICE_ACTION_CAPTURE);
+ 
+@@ -660,7 +707,7 @@ fpi_image_device_activate_complete (FpImageDevice *self, GError *error)
+ /**
+  * fpi_image_device_deactivate_complete:
+  * @self: a #FpImageDevice imaging fingerprint device
+- * @error: (nullable) (transfer full): The #GError or %NULL on success
++ * @error: A #GError or %NULL on success
+  *
+  * Reports completion of device deactivation.
+  */
+@@ -687,7 +734,7 @@ fpi_image_device_deactivate_complete (FpImageDevice *self, GError *error)
+ /**
+  * fpi_image_device_open_complete:
+  * @self: a #FpImageDevice imaging fingerprint device
+- * @error: (nullable) (transfer full): The #GError or %NULL on success
++ * @error: A #GError or %NULL on success
+  *
+  * Reports completion of open operation.
+  */
+@@ -715,7 +762,7 @@ fpi_image_device_open_complete (FpImageDevice *self, GError *error)
+ /**
+  * fpi_image_device_close_complete:
+  * @self: a #FpImageDevice imaging fingerprint device
+- * @error: (nullable) (transfer full): The #GError or %NULL on success
++ * @error: A #GError or %NULL on success
+  *
+  * Reports completion of close operation.
+  */
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index d340323..063f41f 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -126,6 +126,9 @@ struct _FpImageDeviceClass
+ void fpi_image_device_set_score_threshold (FpImageDevice *self,
+                                            gint           score_threshold);
+ 
++void fpi_image_device_set_algorithm (FpImageDevice           *self,
++                                     FpiImageDeviceAlgorithm  algorithm);
++
+ void fpi_image_device_session_error (FpImageDevice *self,
+                                      GError        *error);
+ 
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+index fe3cacb..4a572e2 100644
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -1,11 +1,14 @@
+ 
+ sigfm_sources = ['sigfm.cpp']
+ 
+-opencv = dependency('opencv4', 'opencv5', required: true)
+-doctest = dependency('doctest', required: true)
++opencv = dependency('opencv4', required: true)
++doctest = dependency('doctest', required: false)
+ 
+ libsigfm = static_library('sigfm',
+         sigfm_sources,
+         dependencies: [opencv],
+ )
+-sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++
++if doctest.found()
++    sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++endif
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+index 175209b..d4ab8c3 100644
+--- a/libfprint/sigfm/sigfm.cpp
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -15,6 +15,8 @@
+ #include "opencv2/core/types.hpp"
+ #include "opencv2/features2d.hpp"
+ #include "opencv2/imgcodecs.hpp"
++#include "opencv2/imgproc.hpp"
++#include "opencv2/calib3d.hpp"
+ #include <algorithm>
+ #include <cstdio>
+ #include <filesystem>
+@@ -47,37 +49,6 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
+ };
+ } // namespace bin
+ 
+-namespace {
+-constexpr auto distance_match = 0.75;
+-constexpr auto length_match = 0.05;
+-constexpr auto angle_match = 0.05;
+-constexpr auto min_match = 5;
+-struct match {
+-    cv::Point2i p1;
+-    cv::Point2i p2;
+-    match(cv::Point2i ip1, cv::Point2i ip2) : p1{ip1}, p2{ip2} {}
+-    match() : p1{cv::Point2i(0, 0)}, p2{cv::Point2i(0, 0)} {}
+-    bool operator==(const match& right) const
+-    {
+-        return std::tie(this->p1, this->p2) == std::tie(right.p1, right.p2);
+-    }
+-    bool operator<(const match& right) const
+-    {
+-        return (this->p1.y < right.p1.y) ||
+-               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
+-    }
+-};
+-struct angle {
+-    double cos;
+-    double sin;
+-    match corr_matches[2];
+-    angle(double cos_, double sin_, match m1, match m2)
+-        : cos{cos_}, sin{sin_}, corr_matches{m1, m2}
+-    {
+-    }
+-};
+-} // namespace
+-
+ SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info) { return new SigfmImgInfo{*info}; }
+ 
+ int sigfm_keypoints_count(SigfmImgInfo* info) { return info->keypoints.size(); }
+@@ -105,11 +76,44 @@ SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len)
+ SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
+ {
+     try {
+-        const cv::Mat img(height, width, CV_8UC1, (void*)pix);
++        cv::Mat img(height, width, CV_8UC1);
++        std::memcpy(img.data, pix, width * height);
++
++        // Convert to float for signal processing
++        cv::Mat f;
++        img.convertTo(f, CV_32F);
++
++        // 1. Row-banding removal: subtract row medians
++        for (int y = 0; y < f.rows; ++y) {
++            std::vector<float> row(f.cols);
++            for (int x = 0; x < f.cols; ++x) row[x] = f.at<float>(y, x);
++            std::nth_element(row.begin(), row.begin() + row.size() / 2, row.end());
++            float median = row[row.size() / 2];
++            for (int x = 0; x < f.cols; ++x) f.at<float>(y, x) -= median;
++        }
++
++        // 2. Bandpass filter: highpass (sigma=5.0) + lowpass (sigma=0.8)
++        cv::Mat blur5, blur08;
++        cv::GaussianBlur(f, blur5, cv::Size(0, 0), 5.0);
++        f = f - blur5;
++        cv::GaussianBlur(f, blur08, cv::Size(0, 0), 0.8);
++
++        // 3. Normalize to [0, 255]
++        cv::Mat norm;
++        cv::normalize(blur08, norm, 0, 255, cv::NORM_MINMAX, CV_8U);
++
++        // 4. Upscale small sensor frames (e.g., 80x80 -> 160x160) for robust SIFT keypoints
++        cv::Mat proc;
++        if (width <= 128 && height <= 128) {
++            cv::resize(norm, proc, cv::Size(160, 160), 0, 0, cv::INTER_CUBIC);
++        } else {
++            proc = norm;
++        }
+ 
+         std::vector<cv::KeyPoint> pts;
+         cv::Mat descs;
+-        cv::SIFT::create()->detectAndCompute(img, cv::Mat(), pts, descs);
++        auto sift = cv::SIFT::create(0, 3, 0.01, 20.0);
++        sift->detectAndCompute(proc, cv::noArray(), pts, descs);
+ 
+         auto* info = new SigfmImgInfo{pts, descs};
+         return info;
+@@ -121,81 +125,69 @@ SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
+ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+ {
+     try {
+-        std::vector<std::vector<cv::DMatch>> points;
++        if (!frame || !enrolled)
++            return 0;
++        if (frame->descriptors.empty() || enrolled->descriptors.empty())
++            return 0;
++        if (frame->keypoints.size() < 3 || enrolled->keypoints.size() < 3)
++            return 0;
++
++        std::vector<std::vector<cv::DMatch>> matches;
+         auto bfm = cv::BFMatcher::create();
+-        bfm->knnMatch(frame->descriptors, enrolled->descriptors, points, 2);
+-        std::set<match> matches_unique;
+-        int nb_matched = 0;
+-        for (const auto& pts : points) {
+-            if (pts.size() < 2) {
+-                continue;
+-            }
+-            const cv::DMatch& match_1 = pts.at(0);
+-            if (match_1.distance < distance_match * pts.at(1).distance) {
+-                matches_unique.emplace(
+-                    match{frame->keypoints.at(match_1.queryIdx).pt,
+-                          enrolled->keypoints.at(match_1.trainIdx).pt});
+-                nb_matched++;
++        bfm->knnMatch(frame->descriptors, enrolled->descriptors, matches, 2);
++
++        std::vector<cv::Point2f> pts_frame;
++        std::vector<cv::Point2f> pts_enrolled;
++
++        for (const auto& m : matches) {
++            if (m.size() == 2 && m[0].distance < 0.8 * m[1].distance) {
++                pts_frame.push_back(frame->keypoints.at(m[0].queryIdx).pt);
++                pts_enrolled.push_back(enrolled->keypoints.at(m[0].trainIdx).pt);
+             }
+         }
+-        if (nb_matched < min_match) {
++
++        if (pts_frame.size() < 3) {
+             return 0;
+         }
+-        std::vector<match> matches{matches_unique.begin(),
+-                                   matches_unique.end()};
+-
+-        std::vector<angle> angles;
+-        for (std::size_t j = 0; j < matches.size(); j++) {
+-            match match_1 = matches[j];
+-            for (std::size_t k = j + 1; k < matches.size(); k++) {
+-                match match_2 = matches[k];
+-
+-                int vec_1[2] = {match_1.p1.x - match_2.p1.x,
+-                                match_1.p1.y - match_2.p1.y};
+-                int vec_2[2] = {match_1.p2.x - match_2.p2.x,
+-                                match_1.p2.y - match_2.p2.y};
+-
+-                double length_1 = sqrt(pow(vec_1[0], 2) + pow(vec_1[1], 2));
+-                double length_2 = sqrt(pow(vec_2[0], 2) + pow(vec_2[1], 2));
+-
+-                if (1 - std::min(length_1, length_2) /
+-                            std::max(length_1, length_2) <=
+-                    length_match) {
+-
+-                    double product = length_1 * length_2;
+-                    angles.emplace_back(angle(
+-                        M_PI / 2 +
+-                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
+-                                 product),
+-                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
+-                             product),
+-                        match_1, match_2));
+-                }
+-            }
++
++        cv::Mat inliers;
++        cv::Mat affine = cv::estimateAffinePartial2D(pts_frame, pts_enrolled, inliers, cv::RANSAC, 4.0);
++        if (affine.empty() || inliers.empty()) {
++            return 0;
+         }
+ 
+-        if (angles.size() < min_match) {
++        // Biological fingerprint constraint: pixel pitch is fixed (508 DPI),
++        // so genuine finger elasticity allows at most ~20% scale change.
++        double a = affine.at<double>(0, 0);
++        double b = affine.at<double>(1, 0);
++        double scale = std::sqrt(a * a + b * b);
++        if (scale < 0.80 || scale > 1.25) {
+             return 0;
+         }
+ 
+-        int count = 0;
+-        for (std::size_t j = 0; j < angles.size(); j++) {
+-            angle angle_1 = angles[j];
+-            for (std::size_t k = j + 1; k < angles.size(); k++) {
+-                angle angle_2 = angles[k];
+-
+-                if (1 - std::min(angle_1.sin, angle_2.sin) /
+-                                std::max(angle_1.sin, angle_2.sin) <=
+-                        angle_match &&
+-                    1 - std::min(angle_1.cos, angle_2.cos) /
+-                                std::max(angle_1.cos, angle_2.cos) <=
+-                        angle_match) {
+-
+-                    count += 1;
+-                }
++        int inlier_count = cv::countNonZero(inliers);
++        if (inlier_count < 3) {
++            return 0;
++        }
++
++        // Verify spatial spread of inliers on 160x160 image
++        float min_x = 1e9f, max_x = -1e9f;
++        float min_y = 1e9f, max_y = -1e9f;
++        for (int i = 0; i < inliers.rows; ++i) {
++            if (inliers.at<uchar>(i, 0)) {
++                const auto& pt = pts_frame[i];
++                if (pt.x < min_x) min_x = pt.x;
++                if (pt.x > max_x) max_x = pt.x;
++                if (pt.y < min_y) min_y = pt.y;
++                if (pt.y > max_y) max_y = pt.y;
+             }
+         }
+-        return count;
++
++        if ((max_x - min_x) < 25.0f || (max_y - min_y) < 25.0f) {
++            return 0;
++        }
++
++        return inlier_count;
+     }
+     catch (...) {
+         return -1;
+-- 
+2.56.0
+
