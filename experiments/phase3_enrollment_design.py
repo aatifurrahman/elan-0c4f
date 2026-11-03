@@ -11,10 +11,17 @@ Addresses the four Phase 3 requirements in experiments/PLAN.md:
 import itertools
 import os
 import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_vpkgs = os.path.join(_ROOT, ".venv_pkgs")
+if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+    sys.path.insert(0, _vpkgs)
+
 import cv2
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = _HERE
 sys.path.insert(0, HERE)
 from eval_offline import (
     load_dataset,

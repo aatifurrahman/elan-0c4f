@@ -27,7 +27,26 @@ ldconfig -p | grep libfprint-2-tod.so.1
 
 ## 2. Driver Installation
 
-Run the installer from this repository:
+You can install either the **Proprietary Vendor TOD Driver** (requires COPR swap above) or the **Native Upstream Open-Source Driver** (recommended; does not require COPR).
+
+### Option A: Native Upstream Open-Source Driver (Recommended)
+
+The open-source driver embeds native OpenCV SIFT/RANSAC keypoint matching directly into upstream `libfprint` without requiring third-party COPR packages:
+
+```bash
+# 1. Install build dependencies
+sudo dnf install -y meson ninja-build gcc gcc-c++ pkgconf-pkg-config git glib2-devel libgusb-devel opencv-devel
+
+# 2. Build and install to /usr/local
+./elan-0c4f.sh opensource-build
+./elan-0c4f.sh opensource-install
+```
+
+*(SELinux file contexts on `/usr/local/lib64/libfprint-2.so*` are automatically applied by the installer).*
+
+### Option B: Vendor TOD Driver
+
+If using the COPR-swapped `libfprint-tod`:
 
 ```bash
 ./elan-0c4f.sh install

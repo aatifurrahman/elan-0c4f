@@ -115,7 +115,7 @@ Sequence Breakdown:
 | Stage 12 | `360` | 3 | `364`, `368`, `376` | `enroll-stage-passed` |
 | Stage 13 | `380` | 3 | `384`, `388`, `396` | `enroll-stage-passed` |
 | Stage 14 | `400` | 4 | `404`, `408`, `416`, `424` | `enroll-completed` |
-| Completion | `425` | -- | `425` (`00 0b`) | Sensor Idle. Template written to `/var/lib/fprint/aatif/efd_tod/efd_tod/8` |
+| Completion | `425` | -- | `425` (`00 0b`) | Sensor Idle. Template written to `/var/lib/fprint/<user>/efd_tod/efd_tod/8` |
 
 ---
 
@@ -144,22 +144,71 @@ Captured using Wireshark & USBPcap with Administrator privileges during a native
    When enrollment finishes, driver sends `00 0b` (`stop_cmd`) on EP `0x01` (Packet 1437) to turn off LEDs and park the sensor into low-power idle.
 5. **Template Upload to Hardware**: **NONE (0 bytes)**.
 
-### Cross-Platform Implementation Comparison
+### 6.1 Comprehensive Protocol Diff & Driver Comparison (WP5)
 
-| Attribute | Linux Lenovo TOD (`efd_tod`) | Windows Hello Driver (`WBF`) | Upstream `libfprint` (`elan.c`) |
-|---|---|---|---|
-| **Matching Mode** | Match-on-Host (Host CPU) | Match-on-Host (Host CPU) | Match-on-Host (Host CPU) |
-| **Die Dimensions** | $80 \times 80$ (16-bit ADC) | $80 \times 80$ (16-bit ADC) | Configurable / detected via `00 0c` |
-| **Frame Payload** | $12,800\text{ bytes}$ | $12,800\text{ bytes}$ | $12,800\text{ bytes}$ |
-| **Command OUT EP** | `0x01` | `0x01` | `0x01` (`ELAN_EP_CMD_OUT`) |
-| **Status IN EP** | `0x83` | `0x83` | `0x83` (`ELAN_EP_CMD_IN`) |
-| **Image IN EP** | `0x82` | `0x82` | `0x82` (`ELAN_EP_IMG_IN`) |
-| **Wait Command** | `40 3f` $\to$ `0x55` | `40 3f` $\to$ `0x55` | `40 3f` (`pre_scan_cmd`) $\to$ `0x55` |
-| **Capture Command** | `00 09` | `00 09` | `00 09` (`get_image_cmd`) |
-| **Stop Command** | `00 0b` | `00 0b` | `00 0b` (`stop_cmd`) |
-| **Template Storage** | Host disk (`/var/lib/fprint/`) | Host disk (Windows Vault / DPAPI) | Host disk (`/var/lib/fprint/`) |
+The table below contrasts the low-level USB transaction sequences, packet parameters, timing cadences, and lifecycle handling across the three drivers evaluated:
 
-**Definitive Architecture Conclusion**: Both Windows Hello and Linux Lenovo TOD drivers communicate with `04f3:0c4f` using the exact same hardware primitives. The chip does not possess on-chip template memory or an embedded matcher. Upstream `libfprint/drivers/elan.c` already implements the required USB command state machine natively.
+| Protocol Dimension | Windows Hello Driver (WBF) | Linux Lenovo TOD (`efd_tod`) | Open-Source Driver (`libfprint/elan.c`) |
+| :--- | :--- | :--- | :--- |
+| **Trace Source** | `<path_to_trace>.pcapng` | `<path_to_trace>.pcap`, `<path_to_trace>.pcap` | `traces/enroll_20261101_100911.pcap`, `/tmp/wp2_capture.pcap` |
+| **Driver & Firmware Version** | ELAN WBF Driver (OEM, FW `1.65` / `bcdDevice 1.65`) | Lenovo `r1slf01w` (`libfprint-2-tod1-elan.so`, FW `1.65`) | `libfprint 1.95.1` + MR !530 SIGFM patch |
+| **Matching Mode** | **Match-on-Host** (Host CPU, `wbmsvc`) | **Match-on-Host** (Host CPU, `CalcuateMatchScore`) | **Match-on-Host** (Host CPU, `sigfm`) |
+| **Command OUT Endpoint** | `0x01` (Bulk, max packet size 64B) | `0x01` (Bulk, max packet size 64B) | `0x01` (`ELAN_EP_CMD_OUT`, Bulk 64B) |
+| **Status IN Endpoint** | `0x83` (Bulk/Interrupt, 64B) | `0x83` (Bulk/Interrupt, 64B) | `0x83` (`ELAN_EP_CMD_IN`, Bulk 64B) |
+| **Image IN Endpoint** | `0x82` (Bulk, 64B packets, 12,800B/frame) | `0x82` (Bulk, 64B packets, 12,800B/frame) | `0x82` (`ELAN_EP_IMG_IN`, Bulk, 12,800B/frame) |
+| **Command Order Sequence** | 1. `40 31` (LED On / Prepare)<br>2. `40 3f` (Wait for touch)<br>3. `00 09` (Ingest frame burst)<br>4. Host software air detection<br>5. Repeat (2-4) per tap<br>6. `00 0b` (Stop/Idle) | 1. `40 19`, `40 21 0a`, `00 0c` (Init)<br>2. `00 09` (Background frame)<br>3. `40 3f` (Wait for touch)<br>4. `00 09` (Frame 1)<br>5. `40 3e` $\leftrightarrow$ `aa` (Poll status)<br>6. `00 09` (Frame 2..4)<br>7. `00 0b` (Stop/Idle) | 1. `40 19`, `40 21 0a`, `00 0c` (Init)<br>2. `00 09` (Calibration background)<br>3. `40 31` (LED On)<br>4. `40 3f` (Wait for touch)<br>5. `00 09` (Frame 1)<br>6. `40 3f` (Wait touch re-check)<br>7. `00 09` (Frame 2)<br>8. `00 0b` (Stop/Idle) |
+| **Transfer Lengths** | Command OUT: 2 bytes<br>Status IN: 1 byte (`0x55`)<br>Image IN: 12,800 bytes (200x64B) | Command OUT: 2–3 bytes<br>Status IN: 1–4 bytes (`0x55`, `0xaa`)<br>Image IN: 12,800 bytes (200x64B) | Command OUT: 2–3 bytes<br>Status IN: 1–4 bytes (`0x55`)<br>Image IN: 12,800 bytes (200x64B) |
+| **Sensor Readout Time (`00 09` $\to$ Frame)** | **26.31 ms** (median) | **26.32 ms** (median) | **26.32 ms** (median) |
+| **Host Inter-Frame Delay (Frame $\to$ Next `00 09`)**| **0.44 ms** (immediate re-submission) | **104.69 ms** (timer throttle + poll) | **104.40 – 112.22 ms** (SSM cycle delay) |
+| **Streaming Frame Cadence ($\Delta t$)** | **26.78 ms** (median) $\approx \mathbf{37.3\text{ FPS}}$ | **130.96 ms** (median) $\approx \mathbf{7.6\text{ FPS}}$ | **130.71 – 138.56 ms** (median) $\approx \mathbf{7.6\text{ FPS}}$ |
+| **Frames Captured per Touch** | **10 – 16 frames** per tap | **2 – 4 frames** per tap | Exactly **2 frames** per tap (`num_frames >= 2`) |
+| **Finger-Present Detection** | `40 3f` on EP `0x01`, sensor returns `0x55` on EP `0x83` upon capacitive contact | `40 3f` on EP `0x01`, sensor returns `0x55` on EP `0x83` upon capacitive contact | `40 3f` on EP `0x01`, sensor returns `0x55` on EP `0x83` upon capacitive contact |
+| **Finger-Removed / Lift-Off Detection** | **Host CPU pixel intensity threshold**: when mean frame value drops back to air baseline (~4,750 ADC counts), host driver halts `00 09` burst | **USB Polling with `40 3e`**: host sends `40 3e` on EP `0x01`; sensor returns `0xaa` while finger held, blocks or returns non-`0xaa` on lift-off | **Timeout on `40 3f`**: host re-issues `40 3f` with `ELAN_FINGER_TIMEOUT` (200 ms); times out when finger lifts off |
+| **Retry / Error Handling** | Host WBF retry scan notification; recovers gracefully on air frames without USB bus resets | 5000 ms command timeout; on lift-off or timeout issues `00 0b` and triggers host retry | `ELAN_CMD_TIMEOUT` (5000 ms); recoverable 0C4F protocol error suppression (`FP_DEVICE_RETRY_GENERAL`) |
+| **Template Upload to Chip** | **0 bytes** (host vault DPAPI storage) | **0 bytes** (`/var/lib/fprint/` storage) | **0 bytes** (`/var/lib/fprint/` storage) |
+
+---
+
+### 6.2 The 27 ms Frame Cadence Question: Analysis & Resolution
+
+A central question identified in `PLAN.md` (WP5) was:
+> *Why does Windows stream about 27 ms frames for 10–15 frames while Linux gets 1–2, and can the open driver reproduce it?*
+
+#### 1. Hardware vs Software Bottleneck
+Empirical timing analysis of the USB traces disproves the hypothesis that Windows activates a special hardware high-speed capture mode or different sensor register configuration:
+- The time from submitting the read command (`00 09`) to receiving the complete 12,800-byte frame on EP `0x82` is **identical across all three operating environments**:
+  - Windows Hello: **$26.31\text{ ms}$**
+  - Lenovo TOD: **$26.32\text{ ms}$**
+  - Open Driver: **$26.32\text{ ms}$**
+- This $26.3\text{ ms}$ duration represents the physical analog integration, ADC digitization, and bulk USB endpoint FIFO transfer speed of the ELAN 80x80 sensor die ($1 / 0.0263 \approx 38.0\text{ FPS}$).
+
+#### 2. Why Windows Streams at 26.8 ms
+Windows achieves continuous 26.8 ms streaming because:
+1. **Zero-Delay URB Chaining**: The Windows WBF driver pre-queues or immediately re-issues `00 09` on EP `0x01` within **$0.44\text{ ms}$** of the preceding frame's completion packet.
+2. **Elimination of USB Status Polling**: Windows never executes `40 3e` (poll finger presence) during active streaming.
+3. **Host-Side Frame Segmentation**: Windows keeps streaming until the finger physically lifts off, which it detects when the ingested frame ADC counts fall back to the uncompressed air baseline (~4,750 counts). It then issues `40 31` (LED off) and waits for the next touch (`40 3f`).
+
+#### 3. Why Linux Drivers Get 1–2 Frames at ~131 ms Cadence
+1. **Lenovo TOD**:
+   - The vendor driver inserts an intentional software throttle delay of $\sim 104.7\text{ ms}$ between frame requests.
+   - It interleaves `40 3e` on EP `0x01`, which queries status on interrupt EP `0x83`. In the traces, `40 3e` blocks inside the sensor firmware for up to $455\text{ ms}$ before returning `0xaa` (Finger Held), starving the image pipe.
+2. **Open-Source Driver (`elan.c`)**:
+   - In `drivers/elan.c` (`CAPTURE_CHECK_ENOUGH_FRAMES`), the state machine enforces `if (self->num_frames >= 2) fpi_ssm_mark_completed(ssm)`.
+   - After Frame 1, it cycles through `CAPTURE_WAIT_FINGER` (`40 3f`), introducing a $\sim 104\text{ ms}$ cycle before Frame 2 is requested.
+   - Upon capturing Frame 2, it completes acquisition immediately.
+
+#### 4. Can the Open Driver Reproduce 27 ms Streaming?
+**Yes.** The open driver could achieve $\sim 26.8\text{ ms}$ streaming simply by chaining `get_image_cmd` (`00 09`) continuously inside `CAPTURE_READ_DATA` without looping through `CAPTURE_WAIT_FINGER`.
+
+#### 5. Architectural Decision (Informed by WP3)
+Although the open driver *can* stream 10–15 frames at 27 ms, **it should NOT do so**:
+- In **WP3**, multi-frame averaging across $k \in \{3, 5, 10\}$ consecutive frames was rigorously benchmarked on the Windows 10–15 frame traces and proved detrimental to SIFT/RANSAC matching:
+  - Subpixel motion blur and phase-correlation interpolation soften ridge boundaries.
+  - Average SIFT keypoint count dropped from $144.1$ (single frame) to $140.9$ (averaged).
+  - Single-touch FRR worsened from **30.0%** ($k=1$) to **40.0%** ($k=3, 5$).
+- Consequently, capturing 2 frames at ~130 ms cadence and extracting the chronological center contact frame ($k=1$, as verified in WP2) is faster, draws substantially less USB bus bandwidth and power, and provides the highest verification accuracy.
+
+---
 
 ---
 
@@ -169,15 +218,15 @@ Each frame consists of $80 \times 80$ 16-bit unsigned little-endian integers (`<
 The driver performs background calibration subtraction:
 $$\text{Pixel}_{\text{normalized}} = \frac{\max(\text{Pixel}_{\text{touch}} - \text{Baseline}, 0)}{\text{DynamicRange}} \times 255$$
 
-The script [`experiments/extract_frames.py`](experiments/extract_frames.py) extracts all frames directly from any `.pcap` / `.pcapng` capture into standard Netpbm `.pgm` grayscale images in `experiments/traces/<name>_frames/`.
+The script [`experiments/extract_frames.py`](extract_frames.py) extracts all frames directly from any `.pcap` / `.pcapng` capture into standard Netpbm `.pgm` grayscale images in `experiments/traces/<name>_frames/`.
 
 ---
 
 ## 8. Open-Source Driver Architecture Strategy
 
 Given that the hardware is a raw image sensor:
-1. **Target Upstream Driver**: Upstream [`libfprint/drivers/elan.c`](experiments/libfprint-upstream/libfprint/drivers/elan.c) is already designed for ELAN raw image streaming and uses these exact command codes (`00 0c`, `00 09`, `40 3f`, `40 3e`, `00 0b`).
-2. **The 80x80 Pixel Challenge**: Standard `libfprint` uses NIST NBIS (`bozorth3`), which requires $\ge 15$ minutiae points. An $80 \times 80$ sensor provides only 2–4 minutiae per single touch, leading to NBIS verification failure.
+1. **Target Upstream Driver**: Upstream `libfprint/drivers/elan.c` is already designed for ELAN raw image streaming and uses these exact command codes (`00 0c`, `00 09`, `40 3f`, `40 3e`, `00 0b`).
+2. **The 80x80 Pixel Challenge**: Standard `libfprint` uses NIST NBIS (`bozorth3`), which enforces `MIN_COMPUTABLE_BOZORTH_MINUTIAE = 10` (`libfprint/nbis/include/bozorth.h:122`). An $80 \times 80$ sensor provides a median of only 1.0 minutia (mean $1.19 \pm 1.17$) under default parameters on driver-normalized frames, with 100% of touches yielding $< 10$ minutiae (and at most 7 across all preprocessing variants), causing Bozorth3 to abort with score 0 on every single touch.
 3. **Paths Forward**:
    - **Multi-frame Image Stitching**: Ingesting the 2–5 frames per touch (or across touches) to build an enlarged synthetic composite image ($160 \times 160$ or larger) before minutiae extraction.
    - **Phase Correlation Matcher (SigFM / MR !530)**: Using 2D Fourier / spectral phase correlation on raw normalized $80 \times 80$ frames directly, bypassing minutiae extraction entirely.

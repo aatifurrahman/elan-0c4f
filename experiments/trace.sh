@@ -9,9 +9,21 @@ FINGER="${2:-right-index-finger}"
 PERSON="${3:-p01}"
 SESSION="${4:-s01}"
 NOTES="${5:-normal}"
+DRIVER="${6:-auto}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TRACES_DIR="$HERE/traces"
+
+# Detect driver if set to auto
+if [ "$DRIVER" = "auto" ] || [ -z "$DRIVER" ]; then
+  ACTIVE_LIB=$(ldconfig -p 2>/dev/null | grep 'libfprint-2.so.2 ' | head -n 1 | awk '{print $NF}' || true)
+  if [[ "$ACTIVE_LIB" == *"/usr/local/"* ]]; then
+    DRIVER="ubuntu/sigfm"
+  else
+    DRIVER="ubuntu/lenovo-tod"
+  fi
+fi
+
+TRACES_DIR="$HERE/traces/$DRIVER"
 mkdir -p "$TRACES_DIR"
 
 DEV_INFO=$(lsusb -d 04f3:0c4f || true)
@@ -29,6 +41,7 @@ LOG_FILE="$TRACES_DIR/${MODE}_${TS}_capture.log"
 
 echo "=========================================================="
 echo " ELAN 04f3:0c4f Protocol Tracer (Mode: $MODE)"
+echo " Driver: $DRIVER (Active: ${ACTIVE_LIB:-custom})"
 echo " Person: $PERSON | Finger: $FINGER | Session: $SESSION"
 echo " USB Bus: $BUS, Device: $DEV (Interface: $IFACE)"
 echo " PCAP: $PCAP_FILE"
@@ -36,6 +49,12 @@ echo "=========================================================="
 
 # Ensure sudo credentials are ready
 sudo -v
+
+# Ensure usbmon kernel module is loaded
+if ! lsmod | grep -q "^usbmon\b"; then
+  echo "==> Loading usbmon kernel module..."
+  sudo modprobe usbmon
+fi
 
 echo "==> Starting packet capture on $IFACE..."
 sudo tcpdump -i "$IFACE" -w "$PCAP_FILE" -s 0 -U > "$LOG_FILE" 2>&1 &
@@ -65,9 +84,27 @@ echo "----------------------------------------------------------"
 sleep 1.0
 
 echo "==> Stopping capture..."
+set +m 2>/dev/null || true
+TCP_PID=$(pgrep -P "$DUMP_PID" -x tcpdump 2>/dev/null || true)
+if [ -n "$TCP_PID" ]; then
+  sudo kill -INT "$TCP_PID" 2>/dev/null || true
+fi
 sudo kill -INT "$DUMP_PID" 2>/dev/null || true
+
+for ((w=0; w<15; w++)); do
+  kill -0 "$DUMP_PID" 2>/dev/null || break
+  sleep 0.1
+done
+
+if kill -0 "$DUMP_PID" 2>/dev/null; then
+  if [ -n "$TCP_PID" ]; then
+    sudo kill -9 "$TCP_PID" 2>/dev/null || true
+  fi
+  sudo kill -9 "$DUMP_PID" 2>/dev/null || true
+fi
 wait "$DUMP_PID" 2>/dev/null || true
 sudo chown "$USER:" "$PCAP_FILE" "$LOG_FILE" 2>/dev/null || true
+stty sane 2>/dev/null || true
 
 if [ ! -s "$PCAP_FILE" ]; then
   echo "error: PCAP file is empty. Capture log:" >&2
@@ -84,7 +121,7 @@ python3 "$HERE/extract_frames.py" "$PCAP_FILE" || true
 echo "==> Ingesting into dataset..."
 PURPOSE="probe"
 [ "$MODE" = "enroll" ] && PURPOSE="enroll"
-python3 "$HERE/dataset.py" ingest "$PCAP_FILE" "$PERSON" "$FINGER" "$SESSION" "$PURPOSE" "$NOTES" || true
+python3 "$HERE/dataset.py" ingest "$PCAP_FILE" "$PERSON" "$FINGER" "$SESSION" "$PURPOSE" "$NOTES" "$DRIVER" || true
 
 echo ""
 echo "Done! Capture saved and ingested into experiments/data/."

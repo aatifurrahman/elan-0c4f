@@ -15,10 +15,17 @@ import itertools
 import json
 import os
 import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_vpkgs = os.path.join(_ROOT, ".venv_pkgs")
+if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+    sys.path.insert(0, _vpkgs)
+
 import cv2
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = _HERE
 DATA_DIR = os.path.join(HERE, "data")
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
@@ -32,8 +39,9 @@ def prep(f):
     4. Normalize variance.
     """
     f = f.astype(np.float32)
-    # Row-banding removal
-    f = f - np.median(f, axis=1, keepdims=True)
+    # Row-banding removal (upper median matching C++ std::nth_element at size/2)
+    k = f.shape[1] // 2
+    f = f - np.partition(f, k, axis=1)[:, k:k+1]
     # Bandpass filter
     f = f - cv2.GaussianBlur(f, (0, 0), 5.0)
     f = cv2.GaussianBlur(f, (0, 0), 0.8)
@@ -120,11 +128,31 @@ _SIFT = cv2.SIFT_create(contrastThreshold=0.01, edgeThreshold=20)
 _BF = cv2.BFMatcher()
 
 def _extract_sift(img):
-    """Upscales 80x80 -> 160x160 for robust keypoint extraction on small sensors."""
-    p = prep(img)
-    norm = cv2.normalize(p, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    up = cv2.resize(norm, (160, 160), interpolation=cv2.INTER_CUBIC)
-    return _SIFT.detectAndCompute(up, None)
+    """
+    Extracts SIFT features matching libfprint/sigfm/sigfm.cpp exactly:
+    1. Input uint8 image (if unnormalized float, normalize linearly to [0, 255])
+    2. Subtract row upper median (std::nth_element at size/2)
+    3. Gaussian bandpass filter (highpass sigma=5.0, lowpass sigma=0.8)
+    4. Normalize directly to CV_8U in [0, 255]
+    5. Resize to 160x160 with INTER_CUBIC
+    6. SIFT(nfeatures=0, nOctaveLayers=3, contrastThreshold=0.01, edgeThreshold=20.0)
+    """
+    if img.dtype != np.uint8:
+        f_min, f_max = float(img.min()), float(img.max())
+        denom = f_max - f_min if f_max > f_min else 1.0
+        img = np.clip((img.astype(np.float32) - f_min) * 255.0 / denom, 0, 255).astype(np.uint8)
+
+    f = img.astype(np.float32)
+    k = f.shape[1] // 2
+    f = f - np.partition(f, k, axis=1)[:, k:k+1]
+    f = f - cv2.GaussianBlur(f, (0, 0), 5.0)
+    blur08 = cv2.GaussianBlur(f, (0, 0), 0.8)
+    norm = cv2.normalize(blur08, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    if norm.shape[1] <= 128 and norm.shape[0] <= 128:
+        proc = cv2.resize(norm, (160, 160), interpolation=cv2.INTER_CUBIC)
+    else:
+        proc = norm
+    return _SIFT.detectAndCompute(proc, None)
 
 
 def match_sift_ransac(a, b):

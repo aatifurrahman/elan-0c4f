@@ -26,7 +26,8 @@ static int process_image(const char *path, int *out_with_perim, int *out_without
     }
     fclose(f);
 
-    double ppmm = 20.0; // 508 DPI
+    const char *ppmm_env = getenv("NBIS_PPMM");
+    double ppmm = (ppmm_env && *ppmm_env) ? atof(ppmm_env) : 20.0; // Default 508 DPI
 
     for (int mode = 0; mode < 2; mode++) {
         MINUTIAE *minutiae = NULL;

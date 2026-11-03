@@ -17,11 +17,12 @@ VER=0.0.8+0c4f
 SHA_ORIG=a5060ccdfc0c613bd4522be29f87cd94f098e6b83294cf02cd5a958b24b27f80
 SHA_PATCHED=f2ce650d9d9a0a7d547c024bf0929f2b3c45322ebb5927e642b18b0f98fc8ee6
 
-# Open-source build inputs. LIBFPRINT_MR418_REV should be a commit reachable from
-# MR !418's head; set it (env or here) for reproducible builds. Empty = track the
-# MR head as it is today.
+# Open-source build inputs.
+# LIBFPRINT_BASELINE: 'mr530' (modern upstream master rebase, recommended) or 'mr418' (legacy).
 LIBFPRINT_URL="${LIBFPRINT_URL:-https://gitlab.freedesktop.org/libfprint/libfprint.git}"
+LIBFPRINT_BASELINE="${LIBFPRINT_BASELINE:-mr530}"
 LIBFPRINT_MR418_REV="${LIBFPRINT_MR418_REV:-}"
+LIBFPRINT_MR530_REV="${LIBFPRINT_MR530_REV:-}"
 
 
 # ---- distro detection ------------------------------------------------------
@@ -298,6 +299,13 @@ prepare_opensource_src() {
     die "$src_dir exists but does not contain the current patch. Remove it and re-run."
   fi
 
+  local mr_num=530 mr_branch=mr-530-sigfm mr_rev="${LIBFPRINT_MR530_REV:-}"
+  if [ "$LIBFPRINT_BASELINE" = "mr418" ]; then
+    mr_num=418
+    mr_branch=mr-418-sigfm
+    mr_rev="${LIBFPRINT_MR418_REV:-}"
+  fi
+
   command -v git >/dev/null || die "git is required to fetch upstream libfprint"
   mkdir -p "$(dirname "$src_dir")"
   tmp="$src_dir.tmp.$$"
@@ -305,10 +313,10 @@ prepare_opensource_src() {
   echo "==> Cloning upstream libfprint..."
   {
     git clone -q "$LIBFPRINT_URL" "$tmp" &&
-    echo "==> Fetching MR !418 (SIGFM baseline)..." &&
-    git -C "$tmp" fetch -q origin merge-requests/418/head:mr-418-sigfm &&
-    git -C "$tmp" checkout -q "${LIBFPRINT_MR418_REV:-mr-418-sigfm}" &&
-    echo "==> Applying ELAN 0c4f open-source driver patch..." &&
+    echo "==> Fetching MR !$mr_num (SIGFM baseline)..." &&
+    git -C "$tmp" fetch -q origin "merge-requests/$mr_num/head:$mr_branch" &&
+    git -C "$tmp" checkout -q "${mr_rev:-$mr_branch}" &&
+    echo "==> Applying ELAN 0c4f open-source driver patch ($patch_file)..." &&
     git -C "$tmp" apply "$patch_file"
   } || { rm -rf "$tmp"; die "failed to prepare libfprint source (nothing was left behind; see errors above)"; }
 
@@ -317,28 +325,28 @@ prepare_opensource_src() {
     echo "libfprint_head=$(git -C "$tmp" rev-parse HEAD)"
   } > "$tmp/.elan-0c4f-patched"
   mv "$tmp" "$src_dir"
-  echo "==> libfprint source ready at $(git -C "$src_dir" rev-parse --short HEAD) (set LIBFPRINT_MR418_REV to pin)"
+  echo "==> libfprint source ready at $(git -C "$src_dir" rev-parse --short HEAD)"
 }
 
 build_opensource() {
   check_build_deps
 
   local src_dir="$HERE/experiments/libfprint-upstream"
-  local patch_file="$HERE/experimental/elan_0c4f_sigfm_opensource.patch"
+  local patch_file="$HERE/experimental/elan_0c4f_mr530.patch"
+  if [ "$LIBFPRINT_BASELINE" = "mr418" ]; then
+    patch_file="$HERE/experimental/elan_0c4f_sigfm_opensource.patch"
+  fi
 
   prepare_opensource_src "$src_dir" "$patch_file"
 
   local bdir="$src_dir/build"
-  if [ -f "$src_dir/build_test/build.ninja" ]; then
-    bdir="$src_dir/build_test"
-  fi
 
   if [ ! -f "$bdir/build.ninja" ]; then
     echo "==> Configuring meson build in $bdir..."
     meson setup "$bdir" "$src_dir" -Ddrivers=elan -Dintrospection=false -Dudev_rules=disabled -Dudev_hwdb=disabled -Ddoc=false
   fi
 
-  echo "==> Building open-source libfprint with SIGFM (OpenCV SIFT/RANSAC)..."
+  echo "==> Building open-source libfprint with SIGFM (OpenCV SIFT/RANSAC) on baseline $LIBFPRINT_BASELINE..."
   ninja -C "$bdir"
   echo "==> Open-source libfprint built successfully: $bdir/libfprint/libfprint-2.so.2.0.0"
 }
@@ -346,16 +354,10 @@ build_opensource() {
 install_opensource() {
   local src_dir="$HERE/experiments/libfprint-upstream"
   local bdir="$src_dir/build"
-  if [ -f "$src_dir/build_test/libfprint/libfprint-2.so.2.0.0" ]; then
-    bdir="$src_dir/build_test"
-  fi
   local src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
 
   if [ ! -f "$src_so" ]; then
     build_opensource
-    if [ -f "$src_dir/build_test/libfprint/libfprint-2.so.2.0.0" ]; then
-      bdir="$src_dir/build_test"
-    fi
     src_so="$bdir/libfprint/libfprint-2.so.2.0.0"
   fi
 
@@ -420,7 +422,41 @@ uninstall_opensource() {
   echo "=========================================================="
 }
 
-case "${1:-}" in
+show_help() {
+  cat <<'EOF'
+Usage: ./elan-0c4f.sh <command>
+
+Commands:
+  Vendor TOD Driver:
+    build                 Build patched proprietary Lenovo TOD .deb or .so
+    install               Install patched Lenovo TOD driver
+    uninstall             Uninstall patched Lenovo TOD driver
+
+  Open-Source Driver:
+    opensource-build      Build upstream libfprint with SIGFM matcher
+    opensource-install    Install open-source driver to /usr/local
+    opensource-uninstall  Uninstall open-source driver and revert to stock
+
+  Diagnostics & Setup:
+    status                Show active driver, USB sensor, and enrolled prints
+    deps                  Verify open-source build dependencies
+    help, -h, --help      Show this help message
+EOF
+}
+
+if [ $# -eq 0 ]; then
+  show_help >&2
+  exit 1
+fi
+
+if [ $# -gt 1 ]; then
+  echo "error: unexpected arguments: $*" >&2
+  echo "" >&2
+  show_help >&2
+  exit 1
+fi
+
+case "$1" in
   build)
     if [ "$(family)" = deb ]; then build_deb
     else build_so; fi
@@ -472,10 +508,34 @@ case "${1:-}" in
     [ "$(family)" = deb ] && { dpkg -s "$PKG" 2>/dev/null | grep -E '^(Status|Version)' || true
       echo "holds: $(apt-mark showhold | grep -E 'libfprint' || echo none)"; }
     command -v getenforce >/dev/null && echo "selinux: $(getenforce)"
+
+    # PAM scope check per PLAN.md rev 3 Work Package B
+    pam_leaks=""
+    for pf in common-auth polkit-1 su sudo; do
+      if [ -f "/etc/pam.d/$pf" ] && grep -q "pam_fprintd\.so" "/etc/pam.d/$pf" 2>/dev/null; then
+        pam_leaks="$pam_leaks $pf"
+      fi
+    done
+    if [ -n "$pam_leaks" ]; then
+      echo "WARNING: pam_fprintd.so active in root-equivalent PAM service(s):$pam_leaks"
+      echo "         Fingerprint is exposed to sudo/su/polkit. Scope to lockscreen only."
+    else
+      echo "PAM scope: SECURE (pam_fprintd scoped strictly to lockscreen/desktop unlock)"
+    fi
+
     fprintd-list "${USER:-$(id -un)}" 2>&1 | head -8
     ;;
   deps)
     check_build_deps
     ;;
-  *) die "usage: $0 {build|install|uninstall|opensource-build|opensource-install|opensource-uninstall|status|deps}" ;;
+  help|-h|--help)
+    show_help
+    exit 0
+    ;;
+  *)
+    echo "error: unknown command '$1'" >&2
+    echo "" >&2
+    show_help >&2
+    exit 1
+    ;;
 esac

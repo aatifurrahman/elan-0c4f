@@ -1,14 +1,20 @@
 # ELAN 04f3:0c4f Fingerprint Reader on Linux
 
-Complete Linux support for the ELAN `04f3:0c4f` Match-on-Host (MoH) fingerprint sensor (tested and verified on the **Acer Aspire A715-51G**), offering two driver options:
-1. **Open-Source Driver (Primary)**: Upstream `libfprint` combined with unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher) and our local sensor driver patch series in `experimental/` – 100% open-source, zero proprietary binary blobs, with 0 false accepts observed in initial benchmarks ($N=30$, Rule of Three 95% upper bound $\le 10\%$).
-2. **Vendor TOD Driver (Instant Fallback)**: Patched proprietary Match-on-Host shim (`libfprint-2-tod1-elan.so`) derived from Lenovo package `r1slf01w.zip`.
+> [!WARNING]
+> **Experimental / Provisional Status & Security Advisory**:
+> - **False-Accept Rate (FAR) is Unproven**: While 0 false accepts were observed in initial benchmarks ($N=30$), the statistical Rule-of-Three 95% confidence upper bound is only $\le 10\%$. Comprehensive multi-subject evaluation is ongoing.
+> - **PAM Isolation Strongly Recommended**: Fingerprint authentication should **NOT** be used for root-equivalent authentication (`sudo`, `su`, or `polkit`). We strongly advise scoping `pam_fprintd` strictly to desktop lock-screen unlock (`gdm-fingerprint`).
+> - **Password Fallback Preserved**: Password authentication remains functional at all times as a primary fallback.
+
+Linux driver support and experimental tooling for the ELAN `04f3:0c4f` Match-on-Host (MoH) capacitive fingerprint sensor (tested on the **Acer Aspire A715-51G**), offering two driver options:
+1. **Open-Source Driver (Experimental)**: Upstream `libfprint` combined with the SIGFM SIFT/RANSAC keypoint matcher (GitLab MR !530 / MR !418) and our patch series in `experimental/` – 100% open-source, zero proprietary binary blobs.
+2. **Vendor TOD Driver**: Patched proprietary Match-on-Host shim (`libfprint-2-tod1-elan.so`) derived from Lenovo package `r1slf01w.zip`.
 
 ---
 
-## 1. Open-Source Driver (Primary)
+## 1. Open-Source Driver (Experimental)
 
-The open-source driver is not yet merged into upstream `libfprint`. It is built by taking upstream `libfprint` master, incorporating Natasha England-Elbro's unmerged GitLab Merge Request !418 (SIGFM SIFT/RANSAC matcher infrastructure), and applying our local patch series (`experimental/elan_0c4f_sigfm_opensource.patch`). The patch introduces `04f3:0c4f` USB ID support to `drivers/elan.c`, $80 \times 80$ sensor geometry, center-frame selection, row-banding/bandpass filtering, biological scale bounds ($[0.80, 1.25]$), 25 px spatial spread constraints, and a 900 ms finger-off debounce. It installs into `/usr/local/lib64` (Fedora/Arch) or `/usr/local/lib/<multiarch>` (Debian/Ubuntu), which shadows the distro library without modifying package-managed files.
+The open-source driver is not yet merged into upstream `libfprint`. It is built by taking upstream `libfprint` master, incorporating GitLab Merge Request !530 (or MR !418, the SIGFM SIFT/RANSAC matcher infrastructure), and applying our local patch series in `experimental/`. The patch introduces `04f3:0c4f` USB ID support to `drivers/elan.c`, full $80 \times 80$ sensor geometry, center-frame selection, row-banding/bandpass filtering, biological scale bounds ($[0.80, 1.25]$), 25 px spatial spread constraints, a 200 ms touch settle delay, and a 600 ms finger-off debounce. It installs into `/usr/local/lib64` (Fedora/Arch) or `/usr/local/lib/<multiarch>` (Debian/Ubuntu), shadowing the distro library without modifying package-managed files.
 
 ### Build & Runtime Requirements
 
@@ -104,9 +110,13 @@ fprintd-verify "$USER" -f right-middle-finger
 
 # Test desktop unlock
 # Lock screen (Super+L) and unlock with your enrolled finger.
-# Note: On Fedora, if `with-fingerprint` is enabled, sudo also prompts for fingerprint
-# by default. To scope sudo strictly to passwords while keeping desktop lockscreen unlock:
-#   sudo sed -i 's/^auth\s*include\s*system-auth/auth       include      password-auth/' /etc/pam.d/sudo
+# Note: By default on Ubuntu/Debian and Fedora, fprintd PAM modules may prompt for fingerprint
+# on sudo and su. To scope fingerprint authentication strictly to desktop lockscreen unlock:
+#   Ubuntu / Debian:
+#     sudo pam-auth-update --remove fprintd
+#     (Removes pam_fprintd from common-auth; /etc/pam.d/gdm-fingerprint preserves lockscreen unlock)
+#   Fedora (RPM):
+#     sudo sed -i 's/^auth\s*include\s*system-auth/auth       include      password-auth/' /etc/pam.d/sudo
 ```
 
 ### Revert to Distro / TOD
@@ -141,14 +151,14 @@ fprintd-delete "$USER"; fprintd-enroll; fprintd-verify
 
 Live USB packet tracing on both Linux (`usbmon`) and Windows Hello (`USBPcap`) proved that `04f3:0c4f` is an **$80 \times 80$ pixel Match-on-Host (MoH)** raw capacitive image sensor. It continuously streams 16-bit raw ADC frames ($12,800\text{ bytes}$ each) whenever a finger touches the die.
 
-Standard minutiae matching (e.g., NIST NBIS `mindtct` / `bozorth3`) fails on small-area sensors. Across all 86 contact touches in our dataset, we measured this empirically using libfprint's compiled `mindtct`: raw frames yield a median of only **1.0 minutia** (mean $1.19 \pm 1.17$, with 34.9% yielding 0 minutiae and 100% yielding $< 6$ minutiae with perimeter removal), far below the feature density required by minutiae matchers to construct valid topological graphs.
+Standard minutiae matching (e.g., NIST NBIS `mindtct` / `bozorth3`) fails on small-area sensors. In upstream libfprint's NBIS implementation, `MIN_COMPUTABLE_BOZORTH_MINUTIAE` is hardcoded to **10** (`libfprint/nbis/include/bozorth.h:122`). Under default parameters on driver-normalized frames across all 86 contact touches in our dataset, `mindtct` yields a median of only **1.0 minutia** (mean $1.19 \pm 1.17$, with 34.9% yielding 0 minutiae and 100% yielding $< 10$ minutiae with perimeter removal). Testing preprocessing variants (ADC destriping, bandpass filtering, and $2\times$ bicubic upscaling) confirms that 100% of touches still yield $< 10$ minutiae (max 7), causing Bozorth3 to abort with score 0 on every touch. In contrast, our open-source SIGFM matcher achieves decision parity on 1,427 pairs ($\max |Δ\text{score}| = 0$, zero decision flips at threshold 12).
 
 The open-source pipeline solves this via:
 1. **Center Contact Frame Extraction**: Selects the stable center frame (`len / 2`) from multi-frame contact bursts, avoiding initial touch distortion and release smearing.
 2. **ADC Banding Suppression & Bandpass Filtering**: Row median subtraction eliminates 16-bit ADC line banding, followed by a Gaussian bandpass filter ($\sigma_{\text{high}}=5.0, \sigma_{\text{low}}=0.8$).
 3. **OpenCV SIFT Feature Extraction**: Detects rich scale-space keypoints across ridge patterns (uncapped `nfeatures=0`, contrast threshold 0.01, edge threshold 20, upsampled $2\times$ bicubic).
 4. **Biological-Constrained Affine RANSAC**: Enforces physical human skin elasticity constraints ($0.80 \le \text{scale} \le 1.25$) and spatial spread verification ($\ge 25\text{px}$), preventing false feature clustering.
-5. **Touch Debounce**: $900\text{ms}$ software debounce ensures each enrollment stage requires a distinct touch-and-lift motion.
+5. **Touch Debounce**: $600\text{ms}$ software debounce ensures each enrollment stage requires a distinct touch-and-lift motion.
 
 ---
 
@@ -164,18 +174,25 @@ The open-source pipeline solves this via:
 
 ### Evaluation Limitations
 1. **Single-Subject Dataset**: Tested primarily on 1 person across 3 finger classes in initial sessions. Cross-day and multi-person evaluation is ongoing.
-2. **PAM Sudo Scoping**: On Fedora, `authselect enable-feature with-fingerprint` enables `pam_fprintd` globally in `system-auth` (covering `sudo`, lockscreen, and GDM). While password fallback is preserved at all times, users desiring strict security isolation can scope `pam_fprintd` to the lock screen only by changing `/etc/pam.d/sudo` from `auth include system-auth` to `auth include password-auth`:
-   ```bash
-   sudo sed -i 's/^auth\s*include\s*system-auth/auth       include      password-auth/' /etc/pam.d/sudo
-   ```
-   This leaves `gdm-fingerprint` functional while guaranteeing `sudo` remains strictly password-authenticated.
+2. **PAM Sudo Scoping**: By default, distro PAM profiles expose `sudo`, `su`, and `pkexec` to fingerprint prompts. While password fallback is preserved at all times, users desiring strict security isolation can scope fingerprint authentication strictly to the lock screen:
+   - **Ubuntu / Debian**:
+     ```bash
+     sudo pam-auth-update --remove fprintd
+     ```
+     This removes `pam_fprintd.so` from `/etc/pam.d/common-auth` (restoring password-only authentication for `sudo`, `su`, and `pkexec`), while `/etc/pam.d/gdm-fingerprint` preserves lock-screen unlock.
+   - **Fedora (RPM)**:
+     ```bash
+     sudo sed -i 's/^auth\s*include\s*system-auth/auth       include      password-auth/' /etc/pam.d/sudo
+     ```
+     This points `sudo` directly to `password-auth` while leaving `gdm-fingerprint` functional.
+3. **Background Calibration Reuse**: To prevent capturing a resting finger during multi-stage enrollment, the driver reuses the air calibration background across touches and only recalibrates upon device open/activation. This baseline can drift after substantial temperature changes or if a finger is resting on the sensor during initial device calibration.
 
 ---
 
 ## Repository Layout
 - `elan-0c4f.sh` – Unified management CLI (`opensource-build`, `opensource-install`, `opensource-uninstall`, `install`, `uninstall`, `status`, `deps`)
-- `experimental/` – Upstream patch series (`elan_0c4f_sigfm_opensource.patch` for MR !418, `elan_0c4f_mr530.patch` for MR !530) and documentation
-- `experiments/LOG.md` – Experimental log documenting Phases 0 through 7
+- `experimental/` – Upstream patch series (`elan_0c4f_cumulative_master.patch` for master, `elan_0c4f_mr530.patch` for MR !530, `elan_0c4f_sigfm_opensource.patch` for MR !418) and documentation
+- `experiments/LOG.md` – Experimental log documenting development and reverse-engineering phases
 - `experiments/PROTOCOL.md` – Reverse-engineered USB protocol specification (Linux & Windows Hello packet analyses)
 - `experiments/WINDOWS_TRACING.md` – Guide for Windows Hello USBPcap capture and analysis
 - `vendor/` – Local directory for vendor package archives (downloaded on demand by `elan-0c4f.sh`)
@@ -192,3 +209,9 @@ The open-source pipeline solves this via:
 - **FAR / FRR**: False Acceptance Rate (the probability that biometric security falsely authenticates an impostor) / False Rejection Rate (the probability that biometric security rejects a genuine enrolled finger).
 - **Rule of Three**: Statistical principle ($p \le 3/N$ at 95% confidence for zero observed failure events in $N$ independent trials) used to mathematically upper-bound the true FAR when zero false accepts occur in empirical trials.
 - **MR**: GitLab Merge Request (e.g., upstream libfprint MR !418 or MR !530).
+
+---
+
+## Disclaimer
+
+This project is unaffiliated with Lenovo or ELAN Microelectronics. It downloads and patches Lenovo's proprietary driver package locally on your machine at your own risk. This repository does not host, redistribute, or claim ownership over any Lenovo or ELAN proprietary files or binaries.

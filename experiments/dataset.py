@@ -51,7 +51,7 @@ def save_manifest(manifest):
         json.dump(manifest, f, indent=2)
 
 
-def ingest_trace(pcap_path, person_id, finger, session, purpose="probe", notes=""):
+def ingest_trace(pcap_path, person_id, finger, session, purpose="probe", notes="", driver=""):
     """
     Ingests all taps from a pcap/pcapng capture into experiments/data/.
     Splits into touch_NN.npz for each tap.
@@ -68,7 +68,10 @@ def ingest_trace(pcap_path, person_id, finger, session, purpose="probe", notes="
     base, air = air_baseline(frames)
     state = classify(frames, base, air)
 
-    dest_dir = os.path.join(DATA_DIR, person_id, finger, session)
+    if driver:
+        dest_dir = os.path.join(DATA_DIR, driver, person_id, finger, session)
+    else:
+        dest_dir = os.path.join(DATA_DIR, person_id, finger, session)
     os.makedirs(dest_dir, exist_ok=True)
 
     manifest = load_manifest()
@@ -124,11 +127,13 @@ def ingest_trace(pcap_path, person_id, finger, session, purpose="probe", notes="
             finger=finger,
             session=session,
             purpose=purpose,
+            driver=driver,
             notes=notes,
         )
 
         entry = {
             "rel_path": rel_path,
+            "driver": driver if driver else ("ubuntu/lenovo-tod" if session == "s01_lin" else ("windows/vendor" if session == "s01_win" else "ubuntu/sigfm")),
             "person_id": person_id,
             "finger": finger,
             "session": session,
@@ -158,62 +163,59 @@ def ingest_trace(pcap_path, person_id, finger, session, purpose="probe", notes="
 def show_summary():
     manifest = load_manifest()
     touches = manifest.get("touches", [])
-    print("=" * 65)
+    print("=" * 75)
     print(f" ELAN 04f3:0c4f Dataset Summary ({len(touches)} total touches)")
-    print("=" * 65)
+    print("=" * 75)
 
     if not touches:
         print("Dataset is currently empty. Run ingest to add data.")
         return
 
-    # Count by person, finger, purpose
+    # Count by driver, person, finger, purpose
+    drivers = set()
     people = set()
     fingers = set()
     sessions = set()
-    classes = {}  # (person, finger) -> {enroll: int, probe: int, contact_touches: int}
+    driver_classes = {}  # (driver, person, finger) -> {enroll: int, probe: int, usable_touches: int}
 
     for t in touches:
+        d = t.get("driver", "unknown")
         p, f, s, pur = t["person_id"], t["finger"], t["session"], t["purpose"]
+        drivers.add(d)
         people.add(p)
         fingers.add(f)
         sessions.add(s)
-        key = (p, f)
-        if key not in classes:
-            classes[key] = {"enroll": 0, "probe": 0, "usable_touches": 0}
-        classes[key][pur] = classes[key].get(pur, 0) + 1
+        key = (d, p, f)
+        if key not in driver_classes:
+            driver_classes[key] = {"enroll": 0, "probe": 0, "usable_touches": 0}
+        driver_classes[key][pur] = driver_classes[key].get(pur, 0) + 1
         if t["contact_frames"] > 0:
-            classes[key]["usable_touches"] += 1
+            driver_classes[key]["usable_touches"] += 1
 
+    print(f"Drivers:         {len(drivers)} ({', '.join(sorted(drivers))})")
     print(f"Unique Persons:  {len(people)} ({', '.join(sorted(people))})")
-    print(f"Unique Fingers:  {len(classes)} classes")
+    print(f"Unique Fingers:  {len(fingers)} fingers")
     print(f"Unique Sessions: {len(sessions)} ({', '.join(sorted(sessions))})")
-    print("-" * 65)
-    print(f"{'Person':<8} {'Finger':<24} {'Enroll':<8} {'Probe':<8} {'Usable':<8}")
-    print("-" * 65)
-    for (p, f), cnts in sorted(classes.items()):
-        print(f"{p:<8} {f:<24} {cnts['enroll']:<8} {cnts['probe']:<8} {cnts['usable_touches']:<8}")
+    print("-" * 75)
+    print(f"{'Driver':<20} {'Person':<8} {'Finger':<24} {'Enroll':<8} {'Probe':<8} {'Usable':<8}")
+    print("-" * 75)
+    for (d, p, f), cnts in sorted(driver_classes.items()):
+        print(f"{d:<20} {p:<8} {f:<24} {cnts['enroll']:<8} {cnts['probe']:<8} {cnts['usable_touches']:<8}")
 
-    # Calculate possible genuine & impostor trials
-    usable_classes = {k: v for k, v in classes.items() if v["usable_touches"] > 0}
-    num_classes = len(usable_classes)
-    total_probes = sum(v["probe"] for v in usable_classes.values())
-    impostor_trials = sum(v["probe"] * (num_classes - 1) for v in usable_classes.values())
-
-    print("-" * 65)
-    print(f"Usable finger classes: {num_classes}")
-    print(f"Total probe touches:   {total_probes}")
-    print(f"Possible Impostor Trials (probes vs other galleries): {impostor_trials}")
-    if impostor_trials > 0:
-        far_bound = 3.0 / impostor_trials
-        print(f"Current Upper Bound on Zero-FA FAR (Rule of Three): < {far_bound:.4f} ({far_bound*100:.2f}%)")
-    print("=" * 65)
+    print("-" * 75)
+    for d in sorted(drivers):
+        d_touches = [t for t in touches if t.get("driver") == d]
+        d_usable = sum(1 for t in d_touches if t["contact_frames"] > 0)
+        d_probes = sum(1 for t in d_touches if t["purpose"] == "probe")
+        print(f"Driver [{d}]: {len(d_touches)} touches ({d_usable} usable, {d_probes} probes)")
+    print("=" * 75)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage:")
         print("  python3 dataset.py summary")
-        print("  python3 dataset.py ingest <trace.pcap|pcapng> <person_id> <finger> <session> [enroll|probe] [notes]")
+        print("  python3 dataset.py ingest <trace.pcap|pcapng> <person_id> <finger> <session> [enroll|probe] [notes] [driver]")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -221,7 +223,7 @@ if __name__ == "__main__":
         show_summary()
     elif cmd == "ingest":
         if len(sys.argv) < 6:
-            print("Usage: python3 dataset.py ingest <trace> <person_id> <finger> <session> [purpose] [notes]")
+            print("Usage: python3 dataset.py ingest <trace> <person_id> <finger> <session> [purpose] [notes] [driver]")
             sys.exit(1)
         pcap = sys.argv[2]
         person = sys.argv[3]
@@ -229,7 +231,8 @@ if __name__ == "__main__":
         sess = sys.argv[5]
         purpose = sys.argv[6] if len(sys.argv) > 6 else "probe"
         notes = sys.argv[7] if len(sys.argv) > 7 else ""
-        ingest_trace(pcap, person, finger, sess, purpose, notes)
+        driver = sys.argv[8] if len(sys.argv) > 8 else ""
+        ingest_trace(pcap, person, finger, sess, purpose, notes, driver)
         show_summary()
     else:
         print(f"Unknown command: {cmd}")

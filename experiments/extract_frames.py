@@ -110,7 +110,7 @@ def find_latest_trace():
     f = [os.path.join(d, x) for x in os.listdir(d) if x.endswith((".pcap", ".pcapng"))]
     return max(f, key=os.path.getmtime) if f else None
 
-def extract_frames(path, raw16=False):
+def extract_frames(path, raw16=False, show_preview=False):
     print("=" * 70 + f"\n ELAN 04f3:0c4f Frame Extractor\n Trace File: {path}\n" + "=" * 70)
     got = read_frames(path)
     if got is None:
@@ -133,7 +133,7 @@ def extract_frames(path, raw16=False):
         print(f"Frame {i:03d} (Pkt {pkt[i]:>4}, T={t[i]:>7.3f}s, tap {tap[i]:2d}): {names[state[i]]:<10} "
               f"Min={f.min():>5} Max={f.max():>5} Avg={f.mean():>7.1f} -> {name}")
     good = np.where(state == 2)[0]
-    if len(good):
+    if show_preview and len(good):
         best = good[np.argmax(d[good].mean((1, 2)))]
         print("\n" + "=" * 50 + f"\n ASCII Ridge Preview (frame {best}, strongest contact):\n" + "=" * 50)
         print(render_ascii_art(list(d[best].ravel()), W, H, 40) + "\n" + "=" * 50 + "\n")
@@ -142,5 +142,5 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     pcap = args[0] if args else find_latest_trace()
     if not pcap or not os.path.isfile(pcap):
-        print("Usage: python3 experiments/extract_frames.py <trace.pcap|pcapng> [--raw16]"); sys.exit(1)
-    extract_frames(pcap, "--raw16" in sys.argv)
+        print("Usage: python3 experiments/extract_frames.py <trace.pcap|pcapng> [--raw16] [--preview]"); sys.exit(1)
+    extract_frames(pcap, "--raw16" in sys.argv, "--preview" in sys.argv)

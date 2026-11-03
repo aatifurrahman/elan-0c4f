@@ -8,10 +8,11 @@ experiments/**/*.log
 experiments/measure_mindtct
 experiments/sigfm_scorer
 experiments/traces/*.txt
-
+experiments/Elan-04f3-0c6e-*
 # Proprietary vendor binaries & archives
 vendor/*.zip
 vendor/*.so
+*.so
 
 # Internal agent scaffolding
 .AGENT
@@ -24,4 +25,6 @@ AGENT.md
 **/test-storage*
 experiments/data/
 data/
+.venv*
+*.pid
 

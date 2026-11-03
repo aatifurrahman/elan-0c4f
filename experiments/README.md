@@ -29,11 +29,13 @@ Historical community efforts categorized `04f3:0c4f` as an ELAN Match-on-Chip (M
 |      40 31 (LED On) -> 40 3f (Wait) -> 55 (Touch) -> 00 09 (Frame) -> 00 0b   |
 |                                                                               |
 | 5. Root Cause of Open-Source Failure: Stock libfprint uses NIST NBIS          |
-|    (bozorth3), which requires >= 6-10 minutiae to build constellation graphs.  |
-|    Across 86 dataset touches on this 80x80 sensor, mindtct yields a median of  |
-|    only 1.0 minutia (mean 1.19 +/- 1.17, 34.9% zero minutiae, 100% < 6).      |
-|    Lenovo's driver succeeds because it bundles a proprietary host-side         |
-|    image cross-correlation algorithm (efd_tod), NOT because of on-chip matching|
+|    (bozorth3), which hardcodes MIN_COMPUTABLE_BOZORTH_MINUTIAE = 10 in         |
+|    bozorth.h:122. Under default parameters on driver-normalized frames across  |
+|    all 86 dataset touches, mindtct yields a median of only 1.0 minutia (mean   |
+|    1.19 +/- 1.17, 34.9% zero minutiae, 100% < 10). Bozorth3 returns score 0 on |
+|    100% of touches. Preprocessing variants (destriping, bandpass, 2x upscaling)|
+|    still result in 100% < 10 minutiae (max 7). Lenovo's driver succeeds because|
+|    it bundles a proprietary host-side cross-correlation algorithm (efd_tod).   |
 +-------------------------------------------------------------------------------+
 ```
 
@@ -111,5 +113,16 @@ Because the hardware commands in upstream `libfprint/drivers/elan.c` already mat
    - Operates directly in the frequency domain (2D Fourier phase correlation) on raw grayscale frames.
    - Does not rely on minutiae points; designed specifically for small-area sensors ($\le 96 \times 96$).
 
-2. **Path 2: Multi-Frame Image Stitching**:
-   - As observed in Windows Hello (which streams 8–12 continuous frames per tap at 38 FPS), assembling consecutive overlapping frames into a composite $160 \times 160$ synthetic image provides $\ge 20$ minutiae, satisfying NIST NBIS requirements.
+2. **Path 2: Multi-Frame Image Stitching (Historical Hypothesis — Infeasible)**:
+   - Early hypothesis considered assembling consecutive frames into a composite image to reach NIST NBIS minutiae thresholds. Subsequent empirical testing on actual raw frames with `mindtct` proved this infeasible: single-touch frames yield a median of only 1.0 minutia (max 7 across all preprocessing variants), failing the NBIS threshold `MIN_COMPUTABLE_BOZORTH_MINUTIAE = 10`. This path was abandoned in favor of SIFT/RANSAC keypoint matching (SIGFM).
+
+---
+
+## 6. Open-Source Matcher Verification (SIGFM SIFT/RANSAC)
+
+Following evaluation of small-area matching architectures, upstream `libfprint` Merge Request !418 (SIGFM SIFT/RANSAC) was selected, patched, and benchmarked:
+1. **Decision Parity on 1,427 Pairs**: Evaluated all 1,427 gallery/probe pairs (646 genuine, 781 impostor) across the dataset. The production C++ matcher (`sigfm.cpp` / `sigfm_scorer.cpp`) and offline Python harness (`eval_offline.py`) achieve exact bit-for-bit score equivalence ($\max |Δ\text{score}| = 0$, mean $|Δ\text{score}| = 0.0000$) and **zero decision flips** at threshold 12.
+2. **Impostor Rejection**: Max impostor score across all cross-finger probe pairings is **4–5 inliers**, maintaining a strict 7-inlier safety margin below the match threshold of 12.
+3. **Biological Scale Constraints**: The affine scale check $s \in [0.80, 1.25]$ rejects 48.12% of cross-finger impostor pairings, preventing false accepts from distorted keypoint clusters.
+4. **Acquisition Mode**: Single Center Contact Frame extraction ($k=1$) was proven optimal (single-touch FRR 23.5% at $N=16$ stages). Multi-frame averaging softens ridge definitions due to subpixel phase shifts, degrading FRR to 40.0%.
+
