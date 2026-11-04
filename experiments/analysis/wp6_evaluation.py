@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXP_DIR = os.path.dirname(HERE)
 ROOT_DIR = os.path.dirname(EXP_DIR)
 _vpkgs = os.path.join(ROOT_DIR, ".venv_pkgs")
-if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+if os.name != "nt" and os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
     sys.path.insert(0, _vpkgs)
 if EXP_DIR not in sys.path:
     sys.path.insert(0, EXP_DIR)

@@ -58,7 +58,7 @@ Live USB tracing of successful authentication and enrollment proved this false, 
 
 ---
 
-## 4. Verification Protocol Trace (`<path_to_trace>.pcap`)
+## 4. Verification Protocol Sequence Breakdown
 
 ```text
 Sequence Breakdown:
@@ -88,45 +88,38 @@ Sequence Breakdown:
 
 ---
 
-## 5. Enrollment Protocol Trace (`<path_to_trace>.pcap`)
+## 5. Enrollment Protocol Sequence Breakdown
 
-- **Total Packets**: 366
-- **Calibration Frames**: 1 baseline frame (Pkt 94, 12,800 bytes, avg ADC: 4757.5)
-- **Touch Stages (Finger Placements)**: 14 stages
-- **Total Touch Frames Ingested**: 45 frames (each 12,800 bytes)
-- **Total Raw Data Transferred**: 46 frames = 588,800 bytes
+- **Calibration Frames**: 1 baseline frame (avg ADC: ~4,750 counts)
+- **Touch Stages (Finger Placements)**: 14–16 stages
+- **Raw Sensor Frames**: Streaming raw 12,800-byte frames per touch
 - **Hardware Template Upload**: **0 bytes** (100% Host-Side Matching)
 
 ### Stage-by-Stage Frame Breakdown
-| Stage | Start Packet | Frame Count | Packets Ingested | Status |
-|---|---|---|---|---|
-| Calibration | `79` | 1 | `94` | Baseline reference |
-| Stage 1 | `106` | 5 | `110`, `114`, `122`, `130`, `136` | `enroll-stage-passed` |
-| Stage 2 | `148` | 4 | `152`, `156`, `164`, `172` | `enroll-stage-passed` |
-| Stage 3 | `176` | 4 | `180`, `184`, `192`, `200` | `enroll-stage-passed` |
-| Stage 4 | `204` | 4 | `208`, `212`, `220`, `228` | `enroll-stage-passed` |
-| Stage 5 | `232` | 3 | `236`, `240`, `248` | `enroll-stage-passed` |
-| Stage 6 | `252` | 2 | `256`, `264` | `enroll-stage-passed` |
-| Stage 7 | `268` | 2 | `272`, `280` | `enroll-stage-passed` |
-| Stage 8 | `284` | 2 | `288`, `296` | `enroll-stage-passed` |
-| Stage 9 | `300` | 4 | `304`, `308`, `312`, `320` | `enroll-retry-scan` |
-| Stage 10 | `324` | 2 | `328`, `336` | `enroll-stage-passed` |
-| Stage 11 | `340` | 3 | `344`, `348`, `356` | `enroll-stage-passed` |
-| Stage 12 | `360` | 3 | `364`, `368`, `376` | `enroll-stage-passed` |
-| Stage 13 | `380` | 3 | `384`, `388`, `396` | `enroll-stage-passed` |
-| Stage 14 | `400` | 4 | `404`, `408`, `416`, `424` | `enroll-completed` |
-| Completion | `425` | -- | `425` (`00 0b`) | Sensor Idle. Template written to `/var/lib/fprint/<user>/efd_tod/efd_tod/8` |
+| Stage | Relative Event | Frame Count | Status |
+|---|---|---|---|
+| Calibration | Initial probe | 1 | Baseline reference |
+| Stage 1 | Contact detected | 5 | `enroll-stage-passed` |
+| Stage 2 | Contact detected | 4 | `enroll-stage-passed` |
+| Stage 3 | Contact detected | 4 | `enroll-stage-passed` |
+| Stage 4 | Contact detected | 4 | `enroll-stage-passed` |
+| Stage 5 | Contact detected | 3 | `enroll-stage-passed` |
+| Stage 6 | Contact detected | 2 | `enroll-stage-passed` |
+| Stage 7 | Contact detected | 2 | `enroll-stage-passed` |
+| Stage 8 | Contact detected | 2 | `enroll-stage-passed` |
+| Stage 9 | Contact detected | 4 | `enroll-retry-scan` |
+| Stage 10 | Contact detected | 2 | `enroll-stage-passed` |
+| Stage 11 | Contact detected | 3 | `enroll-stage-passed` |
+| Stage 12 | Contact detected | 3 | `enroll-stage-passed` |
+| Stage 13 | Contact detected | 3 | `enroll-stage-passed` |
+| Stage 14 | Contact detected | 4 | `enroll-completed` |
+| Completion | Final command | -- | Sensor Idle (`00 0b`). Template written to disk. |
 
 ---
 
-## 6. Windows Hello Native Enrollment Trace (`<path_to_trace>.pcapng`)
+## 6. Windows Hello Native Protocol Breakdown
 
-Captured using Wireshark & USBPcap with Administrator privileges during a native Windows Hello fingerprint enrollment session:
-- **Trace Path**: `<path_to_trace>.pcapng`
-- **File Size**: $3,942,208\text{ bytes}$
-- **Total USB Packets**: 1,356
-- **Touch Stages (Finger Placements)**: 24 distinct taps across the Windows Hello enrollment wizard
-- **Total Raw ADC Frames**: 301 frames ($3,852,800\text{ bytes}$)
+Captured using Wireshark & USBPcap during native Windows Hello fingerprint operation:
 - **Frame Ingest Timing**: Exactly $26.1\text{ ms}$ per 12,800-byte frame transfer on EP `0x82` ($\sim 38.3\text{ FPS}$ streaming while finger is held)
 - **Sensor Endpoints**:
   - `0x01` OUT: Bulk Command Submissions (64-byte max packet size)
@@ -141,7 +134,7 @@ Captured using Wireshark & USBPcap with Administrator privileges during a native
 3. **Continuous Raw Frame Read**:
    Driver issues `00 09` (`get_image_cmd`) on EP `0x01`. Sensor delivers 12,800 bytes on EP `0x82`. Windows streams ~8–12 frames per tap while the finger is held.
 4. **Sensor Teardown / Sleep**:
-   When enrollment finishes, driver sends `00 0b` (`stop_cmd`) on EP `0x01` (Packet 1437) to turn off LEDs and park the sensor into low-power idle.
+   When enrollment finishes, driver sends `00 0b` (`stop_cmd`) on EP `0x01` to turn off LEDs and park the sensor into low-power idle.
 5. **Template Upload to Hardware**: **NONE (0 bytes)**.
 
 ### 6.1 Comprehensive Protocol Diff & Driver Comparison (WP5)
@@ -150,7 +143,7 @@ The table below contrasts the low-level USB transaction sequences, packet parame
 
 | Protocol Dimension | Windows Hello Driver (WBF) | Linux Lenovo TOD (`efd_tod`) | Open-Source Driver (`libfprint/elan.c`) |
 | :--- | :--- | :--- | :--- |
-| **Trace Source** | `<path_to_trace>.pcapng` | `<path_to_trace>.pcap`, `<path_to_trace>.pcap` | `traces/enroll_20261101_100911.pcap`, `/tmp/wp2_capture.pcap` |
+| **Verification Source** | Windows Hello USB traces | Lenovo TOD USB traces | Open-source driver traces |
 | **Driver & Firmware Version** | ELAN WBF Driver (OEM, FW `1.65` / `bcdDevice 1.65`) | Lenovo `r1slf01w` (`libfprint-2-tod1-elan.so`, FW `1.65`) | `libfprint 1.95.1` + MR !530 SIGFM patch |
 | **Matching Mode** | **Match-on-Host** (Host CPU, `wbmsvc`) | **Match-on-Host** (Host CPU, `CalcuateMatchScore`) | **Match-on-Host** (Host CPU, `sigfm`) |
 | **Command OUT Endpoint** | `0x01` (Bulk, max packet size 64B) | `0x01` (Bulk, max packet size 64B) | `0x01` (`ELAN_EP_CMD_OUT`, Bulk 64B) |

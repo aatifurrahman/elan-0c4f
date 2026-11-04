@@ -31,7 +31,7 @@ MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # Ensure .venv_pkgs and project paths are loaded
 _vpkgs = os.path.join(ROOT_DIR, ".venv_pkgs")
-if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+if os.name != "nt" and os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
     sys.path.insert(0, _vpkgs)
 if EXP_DIR not in sys.path:
     sys.path.insert(0, EXP_DIR)

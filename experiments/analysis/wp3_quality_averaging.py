@@ -39,7 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXP_DIR = os.path.dirname(HERE)
 ROOT_DIR = os.path.dirname(EXP_DIR)
 _vpkgs = os.path.join(ROOT_DIR, ".venv_pkgs")
-if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+if os.name != "nt" and os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
     sys.path.insert(0, _vpkgs)
 if EXP_DIR not in sys.path:
     sys.path.insert(0, EXP_DIR)
@@ -347,8 +347,8 @@ def run_wp3_analysis():
         win_touch_data.append((sub, c_idx))
 
     # Cross-finger impostors for FAR and margin evaluation
-    idx_touches = classes["p01:right-index-finger"]["enroll"][:10]
-    left_touches = classes["p01:left-index-finger"]["enroll"][:10]
+    idx_touches = classes.get("p01:right-index-finger", {}).get("enroll", [])[:10]
+    left_touches = classes.get("p01:left-index-finger", {}).get("enroll", [])[:10]
     impostor_imgs = [t["img"] for t in idx_touches + left_touches]
 
     G_COUNT = 5  # Fixed split: 5 Gallery touches vs 10 Probe touches
@@ -504,7 +504,7 @@ def run_wp3_analysis():
         frr = res["frr_1"]
         imp = res["max_imp"]
         delta_frr = frr - k1_frr
-        print(f"k = {k:2d}: FRR = {frr*100:.1f}% (Δ = {delta_frr*100:+.1f}%), Max Impostor = {imp}")
+        print(f"k = {k:2d}: FRR = {frr*100:.1f}% (d = {delta_frr*100:+.1f}%), Max Impostor = {imp}")
         if frr < k1_frr and imp <= k1_imp:
             averaging_adopted = True
 

@@ -19,7 +19,7 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _vpkgs = os.path.join(_ROOT, ".venv_pkgs")
-if os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
+if os.name != "nt" and os.path.isdir(_vpkgs) and _vpkgs not in sys.path:
     sys.path.insert(0, _vpkgs)
 
 import cv2

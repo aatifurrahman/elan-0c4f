@@ -45,7 +45,7 @@ Historical community efforts categorized `04f3:0c4f` as an ELAN Match-on-Chip (M
 
 | Metric / Parameter | Linux Lenovo TOD (`efd_tod`) | Native Windows Hello (WBF) | Upstream `libfprint` (`elan.c`) |
 | :--- | :--- | :--- | :--- |
-| **Trace Artifact** | `<path_to_trace>.pcap` | `<path_to_trace>.pcapng` | `experimental/elan_0c4f_opensource.patch` |
+| **Evaluation Basis** | USB packet trace audit | USBPcap packet trace audit | Upstream code audit |
 | **Matching Location** | **Host CPU** (`CalcuateMatchScore`) | **Host CPU** (`wbmsvc`) | **Host CPU** (NIST NBIS) |
 | **Hardware Template Upload** | **0 bytes** | **0 bytes** | **0 bytes** |
 | **Sensor Dimensions** | $80 \times 80$ pixels | $80 \times 80$ pixels | $80 \times 80$ pixels (detected) |
@@ -71,9 +71,8 @@ Each 12,800-byte frame represents an $80 \times 80$ grid of 16-bit unsigned inte
 Normalization to standard 8-bit grayscale ($0 - 255$) is performed by subtracting the baseline calibration frame:
 $$\text{Pixel}_{\text{norm}} = \frac{\max(\text{Pixel}_{\text{touch}} - \text{Baseline}, 0)}{\text{DynamicRange}} \times 255$$
 
-Raw sensor frames are **not committed as static binary blobs** to avoid repository bloat; instead, they are generated on demand from the captured traces using `extract_frames.py`:
-- `python extract_frames.py <path_to_trace>.pcapng` $\to$ Generates all 301 frames into `<path_to_extracted_frames>/`
-- `python extract_frames.py <path_to_trace>.pcap` $\to$ Generates all 46 frames into `<path_to_extracted_frames>/`
+Raw sensor frames and participant biometric captures are **not committed to git** to protect user privacy and avoid repository bloat; instead, experimental tooling allows analyzing local captures on demand:
+- `python extract_frames.py <path_to_trace>.pcap` $\to$ Extracts frames into a local directory
 
 ---
 
@@ -82,17 +81,13 @@ Raw sensor frames are **not committed as static binary blobs** to avoid reposito
 ### A. Protocol Decoder (`parse_trace.py`)
 Parses PCAP/PCAPNG files, isolates the ELAN device address, decodes URB transactions, tallies touch taps, and checks hardware command compliance:
 ```bash
-# Analyze Windows trace:
-python parse_trace.py <path_to_trace>.pcapng
-
-# Analyze Linux TOD trace:
 python parse_trace.py <path_to_trace>.pcap
 ```
 
 ### B. Raw Frame Extractor & ASCII Visualizer (`extract_frames.py`)
 Unpacks 12,800-byte transfers, normalizes 16-bit ADC samples to 8-bit grayscale, exports `.pgm` images, and prints terminal ASCII ridge art:
 ```bash
-python extract_frames.py <path_to_trace>.pcapng
+python extract_frames.py <path_to_trace>.pcap
 ```
 
 ### C. Live Linux Protocol Tracer (`trace.sh`)

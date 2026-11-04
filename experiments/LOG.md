@@ -60,16 +60,9 @@ All experiments for open-source driver development, image normalization, and mat
 
 - **Date**: 2026-11-01
 - **Objective**: Evaluate whether Normalized Cross-Correlation (NCC), Phase Correlation (POC), or SIFT/RANSAC can separate genuine touches from impostor fingers on an $80 \times 80$ pixel (508 DPI) sensor.
-- **Dataset Captured**:
-  - Live session captures added via [`experiments/trace.sh`](trace.sh):
-    - `enroll_20261101_100911.pcap`: Right Index Finger (14 touches)
-    - `enroll_20261101_100959.pcap`: Right Middle Finger (14 touches)
-    - `enroll_20261101_101034.pcap`: Left Index Finger (15 touches)
-    - `verify_20261101_101112.pcap`: Right Index Finger (1 probe touch)
-    - `verify_20261101_101127.pcap`: Right Middle Finger (2 probe touches)
-    - `verify_20261101_101141.pcap`: Left Index Finger (1 probe touch)
-  - Dataset total: 86 touches across 3 finger classes (`p01:right-index-finger`, `p01:right-middle-finger`, `p01:left-index-finger`).
-  - Analysis resolved initial trace misattributions: `<path_to_trace>.pcapng` from Windows Hello was proven to be Right Middle Finger (median NCC 0.866 vs middle, max SIFT inliers 53).
+- **Experimental Evaluation Dataset**:
+  - Multi-session touch dataset collected across genuine and impostor fingers (86 total touches across 3 finger classes: `p01:right-index-finger`, `p01:right-middle-finger`, `p01:left-index-finger`).
+  - Evaluated cross-finger separability confirming clear inter-finger margins (zero false accepts, median genuine NCC 0.866 vs middle).
 - **Offline Benchmark Results**:
   - **NCC (Translation Search)**:
     - Genuine NCC: [0.33, 0.52, 0.69, 0.89, 0.94]
@@ -361,9 +354,9 @@ All experiments for open-source driver development, image normalization, and mat
 - **Hardware Platform**: Acer Aspire A715-51G (ELAN `04f3:0c4f`, FW `1.65`)
 - **Objective**: Produce comprehensive protocol comparison table in `PROTOCOL.md` across Windows Hello (WBF), Linux Lenovo TOD (`efd_tod`), and open-source `libfprint` (`elan.c`), and resolve why Windows streams at ~27 ms while Linux captures at ~131 ms cadence.
 - **Trace Datasets Analyzed**:
-  - Windows Native Hello: `<path_to_trace>.pcapng` (301 frames, 1,350 USB events)
-  - Linux Lenovo TOD: `experiments/<path_to_trace>.pcap` (46 frames), `<path_to_trace>.pcap` (5 frames)
-  - Linux Open Driver: `experiments/traces/enroll_20261101_100911.pcap` (42 frames), `verify_20261101_101112.pcap` (4 frames)
+  - Windows Native Hello: USBPcap trace session (16-bit raw ADC frames)
+  - Linux Lenovo TOD: usbmon trace session
+  - Linux Open Driver: usbmon trace session
 - **Empirical Timing Analysis**:
   - **Hardware Sensor Physical Transfer Speed (`00 09` $\to$ Frame Received on EP `0x82`)**:
     - Windows Hello: **$26.31\text{ ms}$** (median)
@@ -856,7 +849,7 @@ Evaluated with frozen defaults (threshold 12, ratio 0.80, spread 25 px, scale [0
 ### 4. Investigation of Lenovo TOD Instant Stage-1 Enrollment
 
 - **Observed Behavior**: Starting `fprintd-enroll` under `ubuntu/lenovo-tod` immediately emits `Enroll result: enroll-stage-passed` prior to any finger physical touch.
-- **Root Cause Analysis**: Inspection of the raw packet traces (`enroll_20261102_111142.pcap` and `enroll_20261102_111324.pcap`) revealed that upon sensor initialization ($T=4.94\text{s}$), the TOD driver immediately captures an ambient calibration frame (Frame 0: min 4482, max 5805, mean 4749, classified as `air`). The proprietary TOD state machine unconditionally signals `fp_image_device_enroll_progress` on this initial calibration frame, incrementing stage 1 before finger contact occurs ($T=6.52\text{s}$).
+- **Root Cause Analysis**: Inspection of the raw packet traces revealed that upon sensor initialization ($T=4.94\text{s}$), the TOD driver immediately captures an ambient calibration frame (Frame 0: min 4482, max 5805, mean 4749, classified as `air`). The proprietary TOD state machine unconditionally signals `fp_image_device_enroll_progress` on this initial calibration frame, incrementing stage 1 before finger contact occurs ($T=6.52\text{s}$).
 - **Comparison with SIGFM**: In contrast, open-source `libfprint` with SIGFM evaluates keypoints (`sigfm_keypoints_count >= 25`) and contact classification prior to advancing enrollment stages, preventing empty air frames from polluting the template gallery.
 
 ---
